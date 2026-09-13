@@ -1,49 +1,360 @@
 import json
+from datetime import datetime, timedelta
+import requests
 
-with open("enex_log.json", "r", encoding="utf-8") as f:
-    data = json.load(f)
+EXTERNAL_IP = "121.144.101.67"
+BASE_PROXY = f"http://{EXTERNAL_IP}:8080/http://192.168.100.10:9935"
 
-# 첫 번째 데이터의 모든 필드(Key, Value) 출력
-print("첫 번째 로그의 전체 데이터 구조:")
-for k, v in data[0].items():
-    print(f"  {k}: {v}")
+SCS_URL = f"{BASE_PROXY}/scs/get"
+ENEX_URL = f"{BASE_PROXY}/enexrcg"
+
+AUTH_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIwMjQyMDY0ODgiLCJuYW1lIjoiaHR0cDovL3d3dy5keWlrMjEuY28ua3IvIiwidmlzaW9uIjoidjQifQ.FWrZJsSj3ElO7tSp4QHMDM5TJ5HsvTyuJK0ByzSv1Q8"
+
+headers = {
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Authorization": AUTH_TOKEN,
+    "Connection": "close",
+    "Content-Type": "application/json",
+    "Origin": "http://192.168.100.10:84",
+    "Referer": "http://192.168.100.10:84/",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,"
+        " like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ),
+}
 
 
+def run_sync():
+    print("📋 1. 정기차량 명부(/scs/get) 수신 중...")
+    scs_payload = {
+        "parkname": "",
+        "carno": "",
+        "username": "",
+        "org": "",
+        "part": "",
+        "pos": "",
+        "scuserid": "",
+        "scsttypeid": "",
+        "shopid": "",
+        "carexist": 0,
+    }
+    try:
+        res_scs = requests.post(SCS_URL, headers=headers, json=scs_payload, timeout=30)
+        scs_data = (
+            res_scs.json()
+            if res_scs.status_code == 200 and len(res_scs.text) > 100
+            else []
+        )
+        print(f"   👉 정기차량 명부 총 {len(scs_data)}건 확보!")
+    except Exception as e:
+        print(f"   ❌ 명부 수신 에러: {e}")
+        scs_data = []
 
-import json
+    print("🚗 2. 실시간 입출차 로그(/enexrcg) 수신 중...")
+    now_str = datetime.now().strftime("%Y-%m-%dT23:59:59")
+    enex_payload = {
+        "parkno": "",
+        "bgndt": "2026-09-10T00:00:00",
+        "enddt": now_str,
+        "carno": "",
+        "enextypeid": "",
+        "tkttypeid": "",
+        "eqno": "",
+    }
+    try:
+        res_enex = requests.post(
+            ENEX_URL, headers=headers, json=enex_payload, timeout=30
+        )
+        enex_data = (
+            res_enex.json()
+            if res_enex.status_code == 200 and len(res_enex.text) > 100
+            else []
+        )
+        print(f"   👉 입출차 로그 총 {len(enex_data)}건 확보!")
+    except Exception as e:
+        print(f"   ❌ 입출차 수신 에러: {e}")
+        enex_data = []
 
-with open("enex_log.json", "r", encoding="utf-8") as f:
-    data = json.load(f)
+    print("🔄 3. 명부 + 입출차 데이터 결합 중...")
+    # 입출차 내역 정렬 (시간 오름차순)
+    enex_map = {}
+    for item in sorted(
+        enex_data,
+        key=lambda x: str(x.get("enexdt") or x.get("entdt") or x.get("io_time") or ""),
+    ):
+        carno_clean = str(item.get("carno") or "").strip().replace(" ", "")
+        if not carno_clean:
+            continue
 
-# 데이터에 들어있는 차량 구분 종류(유형) 전수 조사
-ticket_types = set()
-for item in data:
-    # 관제 시스템 필드명 확인
-    t_name = (
-        item.get("tkttypename")
-        or item.get("tkttypeid")
-        or item.get("carstatus")
-        or "기타"
+        io_name = str(
+            item.get("enextypename") or item.get("etname") or item.get("io") or ""
+        )
+        io_id = str(item.get("enextypeid") or "")
+        is_out = (
+            "출차" in io_name or io_id == "2" or "출" in str(item.get("eqname") or "")
+        )
+        ev_time = str(
+            item.get("enexdt") or item.get("entdt") or item.get("io_time") or ""
+        ).replace("T", " ")
+        gate = item.get("eqname") or item.get("parkname") or "-"
+
+        if carno_clean not in enex_map:
+            enex_map[carno_clean] = {
+                "last_in_time": "-",
+                "last_out_time": "-",
+                "is_out": True,
+                "last_event": "-",
+                "last_time": "-",
+            }
+
+        if is_out:
+            enex_map[carno_clean]["last_out_time"] = ev_time
+            enex_map[carno_clean]["is_out"] = True
+            enex_map[carno_clean]["last_event"] = f"출차 ({gate})"
+        else:
+            enex_map[carno_clean]["last_in_time"] = ev_time
+            enex_map[carno_clean]["is_out"] = False
+            enex_map[carno_clean]["last_event"] = f"입차 ({gate})"
+        enex_map[carno_clean]["last_time"] = ev_time
+
+    # 최종 통합 레코드 생성
+    final_records = []
+    seen_cars = set()
+
+    # A. 정기차량 명부 기준 통합
+    for s in scs_data:
+        raw_carno = str(s.get("carno") or "").strip()
+        c_clean = raw_carno.replace(" ", "")
+        if not c_clean:
+            continue
+        seen_cars.add(c_clean)
+
+        dong = str(s.get("part") or "").strip()
+        ho = str(s.get("pos") or "").strip()
+        dong_ho = f"{dong}동 {ho}호".strip() if (dong or ho) else "-"
+        log = enex_map.get(c_clean, {})
+
+        final_records.append(
+            {
+                "carno": raw_carno,
+                "name": str(s.get("name") or s.get("username") or "-").strip(),
+                "dong_ho": dong_ho,
+                "phone": (
+                    str(s.get("tel") or s.get("hp") or s.get("phone") or "-")
+                    .replace("-", "")
+                    .strip()
+                ),
+                "parking_status": (
+                    "⚪ 출차 완료" if log.get("is_out", True) else "🟢 주차 중"
+                ),
+                "last_event": log.get("last_event", "-"),
+                "last_in_time": log.get("last_in_time", "-"),
+                "last_out_time": log.get("last_out_time", "-"),
+                "last_time": log.get("last_time", "-"),
+                "is_regular": True,
+            }
+        )
+
+    # B. 명부에는 없지만 최근 입출차한 일반/방문 차량도 추가
+    for c_clean, log in enex_map.items():
+        if c_clean not in seen_cars:
+            final_records.append(
+                {
+                    "carno": c_clean,
+                    "name": "-",
+                    "dong_ho": "-",
+                    "phone": "-",
+                    "parking_status": "⚪ 출차 완료" if log["is_out"] else "🟢 주차 중",
+                    "last_event": log["last_event"],
+                    "last_in_time": log["last_in_time"],
+                    "last_out_time": log["last_out_time"],
+                    "last_time": log["last_time"],
+                    "is_regular": False,
+                }
+            )
+
+    with open("enex_log.json", "w", encoding="utf-8") as f:
+        json.dump(final_records, f, ensure_ascii=False, indent=2)
+
+    print(
+        f"💾 총 {len(final_records)}건의 완전체 데이터가 enex_log.json에 저장되었습니다!"
     )
-    ticket_types.add(str(t_name))
 
-print(f"총 수집된 차량 유형 목록: {ticket_types}\n")
 
-# 유형별 샘플 출력
-print(f"{'차량번호':<12} | {'게이트명':<15} | {'권한/유형':<15} | {'통과일시'}")
-print("-" * 65)
-for item in data[:10]:
-    carno = item.get("carno") or "-"
-    gate = item.get("eqname") or "-"
-    tkttype = (
-        item.get("tkttypename")
-        or item.get("tkttypeid")
-        or item.get("parktypename")
-        or "-"
-    )
-    dt = item.get("enexdt") or item.get("entdt") or "-"
-    print(f"{carno:<12} | {gate:<15} | {tkttype:<15} | {dt}")
+if __name__ == "__main__":
+    run_sync()
 
+
+# import json
+# import requests
+
+# EXTERNAL_IP = "121.144.101.67"
+# URL = f"http://{EXTERNAL_IP}:8080/http://192.168.100.10:9935/enexrcg"
+
+# AUTH_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIwMjQyMDY0ODgiLCJuYW1lIjoiaHR0cDovL3d3dy5keWlrMjEuY28ua3IvIiwidmlzaW9uIjoidjQifQ.FWrZJsSj3ElO7tSp4QHMDM5TJ5HsvTyuJK0ByzSv1Q8"
+
+# headers = {
+#     "Accept": "application/json, text/javascript, */*; q=0.01",
+#     "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+#     "Authorization": AUTH_TOKEN,
+#     "Connection": "keep-alive",
+#     "Content-Type": "application/json",
+#     "Origin": "http://192.168.100.10:84",
+#     "Referer": "http://192.168.100.10:84/",
+#     "User-Agent": (
+#         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,"
+#         " like Gecko) Chrome/131.0.0.0 Safari/537.36"
+#     ),
+# }
+
+# # 9월 11일 ~ 오늘(9월 13일 23:59:59)까지 전체 입출차 조회
+# payload = {
+#     "parkno": "",
+#     "bgndt": "2026-09-11T00:00:00",
+#     "enddt": "2026-09-13T23:59:59",
+#     "carno": "",
+#     "enextypeid": "",
+#     "tkttypeid": "",
+#     "eqno": "",
+# }
+
+# print("🚗 실시간 입출차 로그 수신 중...")
+# res = requests.post(URL, headers=headers, json=payload, timeout=30)
+
+# if res.status_code == 200 and len(res.text) > 100:
+#     data = res.json()
+#     print(f"🎉 성공!! 총 {len(data)}건의 최신 입출차 로그를 확보했습니다!\n")
+
+#     with open("enex_log.json", "w", encoding="utf-8") as f:
+#         json.dump(data, f, ensure_ascii=False, indent=2)
+#     print("💾 최신 enex_log.json 파일로 갱신 완료!")
+# else:
+#     print(f"❌ 실패 (상태 코드: {res.status_code})")
+
+
+# import json
+# import os
+# import requests
+# from fastapi import FastAPI, Query
+
+# app = FastAPI()
+# LOCAL_FILE = "enex_log.json"
+# TARGET_URL = "http://192.168.100.10:9935/enexrcg"
+
+
+# @app.get("/search")
+# def search_car(q: str = Query(..., description="검색어")):
+#     q = q.strip().replace(" ", "")
+#     records = []
+
+#     # 1. 실시간 관제 접속 시도
+#     try:
+#         res = requests.get(TARGET_URL, timeout=1)
+#         if res.status_code == 200:
+#             records = res.json()
+#     except Exception:
+#         records = []
+
+#     # 2. 관제 접속 실패 시 (집/외부/네트워크 미연결), 로컬 JSON 파일 자동 로드
+#     if not records and os.path.exists(LOCAL_FILE):
+#         try:
+#             with open(LOCAL_FILE, "r", encoding="utf-8") as f:
+#                 raw = json.load(f)
+#                 records = (
+#                     raw
+#                     if isinstance(raw, list)
+#                     else (raw.get("rows") or raw.get("data") or raw.get("list") or [])
+#                 )
+#         except Exception:
+#             records = []
+
+#     if not records:
+#         return {
+#             "result": "error",
+#             "message": "관제 서버 및 로컬 데이터 모두 접근 불가",
+#         }
+
+#     # 3. 검색 로직 수행 (차량번호, 이름, 동호수, 전화번호)
+#     matched = []
+#     for item in records:
+#         carno = str(item.get("carno", "")).replace(" ", "")
+#         name = str(item.get("siname", "")).strip()
+#         dong = str(item.get("part", "")).strip()
+#         ho = str(item.get("pos", "")).strip()
+#         dong_ho = f"{dong}동 {ho}호"
+#         phone = (
+#             str(item.get("tel") or item.get("hp") or item.get("phone") or "")
+#             .replace("-", "")
+#             .strip()
+#         )
+
+#         if (
+#             (q in carno)
+#             or (q == name)
+#             or (q in dong_ho.replace(" ", ""))
+#             or (phone and q in phone)
+#         ):
+#             matched.append(
+#                 {
+#                     "carno": item.get("carno"),
+#                     "dong_ho": dong_ho,
+#                     "name": name,
+#                     "phone": phone,
+#                     "parking_status": (
+#                         "🟢 주차 중" if item.get("io") == "입차" else "⚪ 출차 완료"
+#                     ),
+#                     "last_time": item.get("io_time", ""),
+#                 }
+#             )
+
+#     return {"result": "success", "count": len(matched), "data": matched}
+
+
+# import json
+
+# with open("enex_log.json", "r", encoding="utf-8") as f:
+#     data = json.load(f)
+
+# # 첫 번째 데이터의 모든 필드(Key, Value) 출력
+# print("첫 번째 로그의 전체 데이터 구조:")
+# for k, v in data[0].items():
+#     print(f"  {k}: {v}")
+
+
+# import json
+
+# with open("enex_log.json", "r", encoding="utf-8") as f:
+#     data = json.load(f)
+
+# # 데이터에 들어있는 차량 구분 종류(유형) 전수 조사
+# ticket_types = set()
+# for item in data:
+#     # 관제 시스템 필드명 확인
+#     t_name = (
+#         item.get("tkttypename")
+#         or item.get("tkttypeid")
+#         or item.get("carstatus")
+#         or "기타"
+#     )
+#     ticket_types.add(str(t_name))
+
+# print(f"총 수집된 차량 유형 목록: {ticket_types}\n")
+
+# # 유형별 샘플 출력
+# print(f"{'차량번호':<12} | {'게이트명':<15} | {'권한/유형':<15} | {'통과일시'}")
+# print("-" * 65)
+# for item in data[:10]:
+#     carno = item.get("carno") or "-"
+#     gate = item.get("eqname") or "-"
+#     tkttype = (
+#         item.get("tkttypename")
+#         or item.get("tkttypeid")
+#         or item.get("parktypename")
+#         or "-"
+#     )
+#     dt = item.get("enexdt") or item.get("entdt") or "-"
+#     print(f"{carno:<12} | {gate:<15} | {tkttype:<15} | {dt}")
 
 
 # import json
@@ -105,33 +416,6 @@ for item in data[:10]:
 #     print("💾 enex_log.json 파일로 저장 완료!")
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # import requests
 
 # EXTERNAL_IP = "121.144.101.67"
@@ -175,41 +459,6 @@ for item in data[:10]:
 #     if res.status_code == 200 and len(res.text) > 100:
 #         print(f"🎉 뚫렸다!! 정답 토큰 번호: {i}번 ({len(res.json())}건 수신)")
 #         break
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 # import requests
@@ -266,22 +515,6 @@ for item in data[:10]:
 #             break
 #     except Exception as e:
 #         print(f"후보 {i}번 타임아웃/에러: {e}")
-
-
-
-
-
-
-
-        
-
-
-
-
-
-
-
-
 
 
 # # from datetime import datetime, timedelta
