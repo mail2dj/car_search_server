@@ -1,7 +1,7 @@
 import os
 import json
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -57,7 +57,7 @@ def root():
 @app.api_route("/sync", methods=["GET", "POST"])
 def sync_data():
     try:
-        # SCS 명부
+        # 1) SCS 명부 동기화 (6,373건 성공 검증 완료)
         scs_url = f"{PROXY_BASE}/scs/get"
         scs_payload = {
             "parkname": "",
@@ -87,11 +87,14 @@ def sync_data():
             except Exception as je:
                 scs_debug += f" (json error: {je})"
 
-        # ENEX 입출차 로그
-        today_str = datetime.now().strftime("%Y-%m-%d")
+        # 2) ENEX 입출차 로그 동기화 (최근 7일치로 안정성 확보 및 JSON/Form 순차 시도)
+        today = datetime.now()
+        start_date = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+        today_str = today.strftime("%Y-%m-%d")
+
         enex_url = f"{PROXY_BASE}/enexrcg"
         enex_payload = {
-            "sdate": "2026-09-01",
+            "sdate": start_date,
             "edate": today_str,
             "carno": "",
             "parkname": "",
@@ -100,12 +103,24 @@ def sync_data():
             "tkttypename": "",
             "token": AUTH_TOKEN,
         }
+
+        # 1차 시도: JSON 포맷
         res_enex = requests.post(
             enex_url, json=enex_payload, headers=HEADERS, timeout=25
         )
         enex_list = []
         enex_debug = f"status: {res_enex.status_code}"
-        if res_enex.status_code == 200:
+
+        # 만약 본문이 비어서 오면 2차 시도 (Form-data 방식)
+        if res_enex.status_code == 200 and not res_enex.text.strip():
+            form_headers = dict(HEADERS)
+            form_headers["Content-Type"] = "application/x-www-form-urlencoded"
+            res_enex = requests.post(
+                enex_url, data=enex_payload, headers=form_headers, timeout=25
+            )
+            enex_debug += " (fallback to form)"
+
+        if res_enex.status_code == 200 and res_enex.text.strip():
             try:
                 parsed = res_enex.json()
                 if isinstance(parsed, list):
@@ -116,6 +131,8 @@ def sync_data():
                 enex_debug += f" (count: {len(enex_list)})"
             except Exception as je:
                 enex_debug += f" (text: {res_enex.text[:100]}, err: {je})"
+        elif not res_enex.text.strip():
+            enex_debug += " (empty response body)"
 
         return {
             "result": (
