@@ -34,50 +34,84 @@ headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
 }
 
+
 def fetch_and_merge_data():
-    print("🔄 관제 데이터 동기화 시작...")
-    
-    # 1. 정기차량 명부
+    # 1. 정기차량 명부 수집
     scs_payload = {
-        "parkname": "", "carno": "", "username": "", "org": "", "part": "",
-        "pos": "", "scuserid": "", "scsttypeid": "", "shopid": "", "carexist": 0
+        "parkname": "",
+        "carno": "",
+        "username": "",
+        "org": "",
+        "part": "",
+        "pos": "",
+        "scuserid": "",
+        "scsttypeid": "",
+        "shopid": "",
+        "carexist": 0,
     }
     try:
         r_scs = requests.post(SCS_URL, headers=headers, json=scs_payload, timeout=30)
-        scs_data = r_scs.json() if (r_scs.status_code == 200 and len(r_scs.text) > 100) else []
+        scs_data = (
+            r_scs.json() if (r_scs.status_code == 200 and len(r_scs.text) > 100) else []
+        )
     except Exception as e:
         print(f"❌ 명부 에러: {e}")
         scs_data = []
 
-    # 2. 입출차 로그
+    # 2. 최근 입출차 로그 수집 (전체 동기화용)
     now_str = datetime.now().strftime("%Y-%m-%dT23:59:59")
     enex_payload = {
-        "parkno": "", "bgndt": "2026-09-01T00:00:00", "enddt": now_str,
-        "carno": "", "enextypeid": "", "tkttypeid": "", "eqno": ""
+        "parkno": "",
+        "bgndt": "2026-09-01T00:00:00",
+        "enddt": now_str,
+        "carno": "",
+        "enextypeid": "",
+        "tkttypeid": "",
+        "eqno": "",
     }
     try:
         r_enex = requests.post(ENEX_URL, headers=headers, json=enex_payload, timeout=30)
-        enex_data = r_enex.json() if (r_enex.status_code == 200 and len(r_enex.text) > 100) else []
+        enex_data = (
+            r_enex.json()
+            if (r_enex.status_code == 200 and len(r_enex.text) > 100)
+            else []
+        )
     except Exception as e:
         print(f"❌ 입출차 에러: {e}")
         enex_data = []
 
-    # 3. 데이터 결합 및 차량별 이력/타입 축적
     car_events = {}
-    for item in sorted(enex_data, key=lambda x: str(x.get("enexdt") or x.get("entdt") or x.get("io_time") or "")):
+    for item in sorted(
+        enex_data,
+        key=lambda x: str(x.get("enexdt") or x.get("entdt") or x.get("io_time") or ""),
+    ):
         c_clean = str(item.get("carno") or "").strip().replace(" ", "")
         if not c_clean:
             continue
-            
-        io_name = str(item.get("enextypename") or item.get("etname") or item.get("io") or "")
+
+        io_name = str(
+            item.get("enextypename") or item.get("etname") or item.get("io") or ""
+        )
         io_id = str(item.get("enextypeid") or "")
-        is_out = ("출차" in io_name or io_id == "2" or "출" in str(item.get("eqname") or ""))
-        ev_time = str(item.get("enexdt") or item.get("entdt") or item.get("io_time") or "").replace("T", " ")
+        is_out = (
+            "출차" in io_name or io_id == "2" or "출" in str(item.get("eqname") or "")
+        )
+        ev_time = str(
+            item.get("enexdt") or item.get("entdt") or item.get("io_time") or ""
+        ).replace("T", " ")
         gate = item.get("eqname") or item.get("parkname") or "-"
-        
-        # 권종 및 예약 구분 판별 (방문예약, 모바일예약, 할인권 등)
-        tkt_name = str(item.get("tkttypename") or item.get("tktname") or item.get("enextypename") or "")
-        is_reservation = ("예약" in tkt_name) or ("방문" in tkt_name and "예약" in str(item)) or (str(item.get("tkttypeid")) in ["3", "4", "5"])
+
+        tkt_name = str(
+            item.get("tkttypename")
+            or item.get("tktname")
+            or item.get("enextypename")
+            or ""
+        )
+        is_reservation = (
+            ("예약" in tkt_name)
+            or ("방문" in tkt_name and "예약" in str(item))
+            or (str(item.get("tkttypeid")) in ["3", "4", "5"])
+        )
 
         if c_clean not in car_events:
             car_events[c_clean] = {
@@ -87,7 +121,8 @@ def fetch_and_merge_data():
                 "is_out": True,
                 "last_event": "-",
                 "last_time": "-",
-                "is_reserved": False
+                "is_reserved": False,
+                "tkt_name": tkt_name,
             }
 
         if is_reservation:
@@ -102,16 +137,12 @@ def fetch_and_merge_data():
             car_events[c_clean]["last_in_time"] = ev_time
             car_events[c_clean]["is_out"] = False
             car_events[c_clean]["last_event"] = f"입차 ({gate})"
-        
-        car_events[c_clean]["last_time"] = ev_time
-        car_events[c_clean]["logs"].append({
-            "time": ev_time,
-            "gate": gate,
-            "type": event_label,
-            "tkt": tkt_name
-        })
 
-    # 최종 병합
+        car_events[c_clean]["last_time"] = ev_time
+        car_events[c_clean]["logs"].append(
+            {"time": ev_time, "gate": gate, "type": event_label, "tkt": tkt_name}
+        )
+
     final_records = []
     seen = set()
 
@@ -121,63 +152,80 @@ def fetch_and_merge_data():
         if not c_clean:
             continue
         seen.add(c_clean)
-        
+
         dong = str(s.get("part") or "").strip()
         ho = str(s.get("pos") or "").strip()
         dong_ho = f"{dong}동 {ho}호".strip() if (dong or ho) else "-"
         car_info = car_events.get(c_clean, {})
 
-        final_records.append({
-            "carno": raw_c,
-            "name": str(s.get("name") or s.get("username") or "-").strip(),
-            "dong_ho": dong_ho,
-            "phone": str(s.get("tel") or s.get("hp") or s.get("phone") or "-").replace("-", "").strip(),
-            "parking_status": "⚪ 출차 완료" if car_info.get("is_out", True) else "🟢 주차 중",
-            "car_type": "정기",
-            "last_event": car_info.get("last_event", "-"),
-            "last_in_time": car_info.get("last_in_time", "-"),
-            "last_out_time": car_info.get("last_out_time", "-"),
-            "last_time": car_info.get("last_time", "-"),
-            "history": car_info.get("logs", [])
-        })
+        final_records.append(
+            {
+                "carno": raw_c,
+                "name": str(s.get("name") or s.get("username") or "-").strip(),
+                "dong_ho": dong_ho,
+                "phone": str(s.get("tel") or s.get("hp") or s.get("phone") or "-")
+                .replace("-", "")
+                .strip(),
+                "parking_status": (
+                    "⚪ 출차 완료" if car_info.get("is_out", True) else "🟢 주차 중"
+                ),
+                "car_type": "정기",
+                "tkt_name": car_info.get("tkt_name", "정기차량"),
+                "last_event": car_info.get("last_event", "-"),
+                "last_in_time": car_info.get("last_in_time", "-"),
+                "last_out_time": car_info.get("last_out_time", "-"),
+                "last_time": car_info.get("last_time", "-"),
+                "history": car_info.get("logs", []),
+            }
+        )
 
     for c_clean, car_info in car_events.items():
         if c_clean not in seen:
             car_type = "예약" if car_info["is_reserved"] else "일반"
-            final_records.append({
-                "carno": c_clean,
-                "name": "-",
-                "dong_ho": "-",
-                "phone": "-",
-                "parking_status": "⚪ 출차 완료" if car_info["is_out"] else "🟢 주차 중",
-                "car_type": car_type,
-                "last_event": car_info["last_event"],
-                "last_in_time": car_info["last_in_time"],
-                "last_out_time": car_info["last_out_time"],
-                "last_time": car_info["last_time"],
-                "history": car_info["logs"]
-            })
+            final_records.append(
+                {
+                    "carno": c_clean,
+                    "name": "-",
+                    "dong_ho": "-",
+                    "phone": "-",
+                    "parking_status": (
+                        "⚪ 출차 완료" if car_info["is_out"] else "🟢 주차 중"
+                    ),
+                    "car_type": car_type,
+                    "tkt_name": car_info.get("tkt_name", "일반방문"),
+                    "last_event": car_info["last_event"],
+                    "last_in_time": car_info["last_in_time"],
+                    "last_out_time": car_info["last_out_time"],
+                    "last_time": car_info["last_time"],
+                    "history": car_info["logs"],
+                }
+            )
 
     with open(LOCAL_FILE, "w", encoding="utf-8") as f:
         json.dump(final_records, f, ensure_ascii=False, indent=2)
-        
-    print(f"✅ 동기화 완료: {len(final_records)}건 저장")
+
     return len(final_records)
+
 
 @app.get("/")
 def root():
     return {"status": "ok", "message": "방재실 차량 관제 API"}
+
 
 @app.post("/sync")
 def sync_trigger():
     cnt = fetch_and_merge_data()
     return {"result": "success", "message": f"{cnt}건 동기화 완료", "count": cnt}
 
+
 @app.get("/search")
 def search_car(q: str = Query(..., description="차량번호, 동호수, 성명, 연락처")):
     query = q.strip().replace(" ", "").replace("-", "")
     if not os.path.exists(LOCAL_FILE):
-        return {"result": "error", "message": "동기화 파일이 없습니다. /sync를 실행하세요."}
+        return {
+            "result": "error",
+            "message": "동기화 파일이 없습니다. /sync를 실행하세요.",
+        }
 
     with open(LOCAL_FILE, "r", encoding="utf-8") as f:
         records = json.load(f)
@@ -189,52 +237,120 @@ def search_car(q: str = Query(..., description="차량번호, 동호수, 성명,
         dong_ho = str(item.get("dong_ho", "")).replace(" ", "").replace("-", "")
         phone = str(item.get("phone", "")).replace("-", "").strip()
 
-        if (query in carno) or (query in name) or (query in dong_ho) or (phone != "-" and query in phone):
+        if (
+            (query in carno)
+            or (query in name)
+            or (query in dong_ho)
+            or (phone != "-" and query in phone)
+        ):
             matched.append(item)
 
     return {"result": "success", "count": len(matched), "data": matched}
 
-# 기간별 상세 이력 검색 (타임라인)
-@app.get("/history")
-def get_car_history(carno: str = Query(...), start_date: str = Query(""), end_date: str = Query("")):
-    query = carno.strip().replace(" ", "")
+
+# 방문 예약차량 목록 추출 전용 엔드포인트
+@app.get("/reserved")
+def get_reserved_cars():
     if not os.path.exists(LOCAL_FILE):
         return {"result": "error", "message": "동기화 파일이 없습니다."}
 
     with open(LOCAL_FILE, "r", encoding="utf-8") as f:
         records = json.load(f)
 
-    for item in records:
-        if query in str(item.get("carno", "")).replace(" ", ""):
-            history = item.get("history", [])
-            # 날짜 필터링
-            filtered = []
-            for h in history:
-                h_date = h["time"][:10]  # YYYY-MM-DD
-                if start_date and h_date < start_date:
-                    continue
-                if end_date and h_date > end_date:
-                    continue
-                filtered.append(h)
-            
-            # 최신순 정렬
-            filtered.sort(key=lambda x: x["time"], reverse=True)
+    # 예약차량만 필터링
+    reserved_list = [item for item in records if item.get("car_type") == "예약"]
+    # 최근 활동순 정렬
+    reserved_list.sort(key=lambda x: str(x.get("last_time", "")), reverse=True)
+
+    return {"result": "success", "count": len(reserved_list), "data": reserved_list}
+
+
+# 스크래치 추적용: 차량 풀번호 + 임의 기간(From ~ To) 관제 PC 실시간 단건 조회 (부하 0%)
+@app.get("/history/live")
+def get_live_car_history(
+    carno: str = Query(..., description="차량 풀번호 (예: 04수0572)"),
+    start_date: str = Query(..., description="시작일 YYYY-MM-DD"),
+    end_date: str = Query(..., description="종료일 YYYY-MM-DD"),
+):
+    clean_car = carno.strip().replace(" ", "")
+    bgndt = f"{start_date}T00:00:00"
+    enddt = f"{end_date}T23:59:59"
+
+    payload = {
+        "parkno": "",
+        "bgndt": bgndt,
+        "enddt": enddt,
+        "carno": clean_car,
+        "enextypeid": "",
+        "tkttypeid": "",
+        "eqno": "",
+    }
+
+    try:
+        r = requests.post(ENEX_URL, headers=headers, json=payload, timeout=10)
+        if r.status_code != 200:
             return {
-                "result": "success",
-                "carno": item["carno"],
-                "name": item["name"],
-                "dong_ho": item["dong_ho"],
-                "car_type": item["car_type"],
-                "data": filtered
+                "result": "error",
+                "message": f"관제 서버 응답 에러 ({r.status_code})",
             }
 
-    return {"result": "error", "message": "해당 차량 내역을 찾을 수 없습니다."}
+        data = r.json()
+        if not isinstance(data, list) or len(data) == 0:
+            return {
+                "result": "success",
+                "count": 0,
+                "data": [],
+                "message": "해당 기간 내 입출차 기록이 없습니다.",
+            }
+
+        logs = []
+        for item in data:
+            io_name = str(
+                item.get("enextypename") or item.get("etname") or item.get("io") or ""
+            )
+            io_id = str(item.get("enextypeid") or "")
+            is_out = (
+                "출차" in io_name
+                or io_id == "2"
+                or "출" in str(item.get("eqname") or "")
+            )
+            ev_time = str(
+                item.get("enexdt") or item.get("entdt") or item.get("io_time") or ""
+            ).replace("T", " ")
+            gate = item.get("eqname") or item.get("parkname") or "-"
+            tkt_name = str(
+                item.get("tkttypename")
+                or item.get("tktname")
+                or item.get("enextypename")
+                or "-"
+            )
+
+            logs.append(
+                {
+                    "time": ev_time,
+                    "type": "출차" if is_out else "입차",
+                    "gate": gate,
+                    "tkt": tkt_name,
+                }
+            )
+
+        logs.sort(key=lambda x: x["time"], reverse=True)
+        return {
+            "result": "success",
+            "carno": clean_car,
+            "count": len(logs),
+            "data": logs,
+        }
+
+    except Exception as e:
+        return {"result": "error", "message": f"조회 중 오류 발생: {e}"}
+
 
 if __name__ == "__main__":
     import uvicorn
+
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("server:app", host="0.0.0.0", port=port)
-
 # import json
 # import os
 # from fastapi import FastAPI, Query
