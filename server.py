@@ -21,12 +21,17 @@ ENEX_CACHE_FILE = os.path.join(BASE_DIR, "enex_log.json")
 
 PROXY_BASE = "http://121.144.101.67:8080/http://192.168.100.10:9935"
 
-# 프록시(cors-anywhere 등) 차단 우회 필수 헤더
+# 대영 IOT 전용 인증 토큰
+AUTH_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIwMjQyMDY0ODgiLCJuYW1lIjoiaHR0cDovL3d3dy5keWlrMjEuY28ua3IvIiwidmlzaW9uIjoidjQifQ.FWrZJsSj3ElO7tSp4QHMDM5TJ5HsvTyuJK0ByzSv1Q8"
+
+# 프록시 및 대영 IOT 필수 통신 헤더
 HEADERS = {
     "x-requested-with": "XMLHttpRequest",
     "Origin": "http://121.144.101.67:8080",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Content-Type": "application/json",
+    "token": AUTH_TOKEN,
+    "Authorization": f"Bearer {AUTH_TOKEN}",
 }
 
 
@@ -50,7 +55,7 @@ def root():
     return {"status": "running", "message": "방재실 통합 관제 백엔드 정상 작동 중"}
 
 
-# 1. 1방재실 최신 관제 동기화 (GET/POST 모두 허용)
+# 1. 1방재실 최신 관제 동기화 (GET/POST 지원)
 @app.api_route("/sync", methods=["GET", "POST"])
 def sync_data():
     try:
@@ -67,6 +72,7 @@ def sync_data():
             "scsttypeid": "",
             "shopid": "",
             "carexist": 0,
+            "token": AUTH_TOKEN,
         }
         res_scs = requests.post(scs_url, json=scs_payload, headers=HEADERS, timeout=20)
         scs_list = []
@@ -78,7 +84,7 @@ def sync_data():
             except Exception as je:
                 scs_debug += f" (json parse error: {je})"
 
-        # ENEX 입출차 로그 동기화 (최근 보름치)
+        # ENEX 입출차 로그 동기화
         today_str = datetime.now().strftime("%Y-%m-%d")
         enex_url = f"{PROXY_BASE}/enexrcg"
         enex_payload = {
@@ -89,6 +95,7 @@ def sync_data():
             "eqname": "",
             "enextypename": "",
             "tkttypename": "",
+            "token": AUTH_TOKEN,
         }
         res_enex = requests.post(
             enex_url, json=enex_payload, headers=HEADERS, timeout=25
@@ -106,7 +113,7 @@ def sync_data():
             "result": (
                 "success" if (len(scs_list) > 0 or len(enex_list) > 0) else "warning"
             ),
-            "message": "1방재실 관제 동기화 시도 완료",
+            "message": "1방재실 관제 동기화 완료",
             "scs_count": len(scs_list),
             "enex_count": len(enex_list),
             "scs_debug": scs_debug,
@@ -246,7 +253,7 @@ def search_cars(
     return {"result": "success", "count": len(results), "data": results[:100]}
 
 
-# 3. 아파트너 사전예약 차량 전용 조회
+# 3. 아파트너 사전예약 차량 전용 조회 (날짜별 과거 복원 지원)
 @app.get("/reserved")
 def get_reserved_cars(
     target_date: str = Query("", description="조회할 날짜 (YYYY-MM-DD, 미지정시 전체)")
@@ -381,6 +388,7 @@ def get_vehicle_timeline(
             "eqname": "",
             "enextypename": "",
             "tkttypename": "",
+            "token": AUTH_TOKEN,
         }
         res = requests.post(url, json=payload, headers=HEADERS, timeout=15)
         if res.status_code == 200:
