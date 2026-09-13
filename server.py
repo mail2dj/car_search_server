@@ -21,8 +21,13 @@ ENEX_CACHE_FILE = os.path.join(BASE_DIR, "enex_log.json")
 
 PROXY_BASE = "http://121.144.101.67:8080/http://192.168.100.10:9935"
 
-# ★ 프록시 차단 우회 필수 헤더!
-HEADERS = {"x-requested-with": "XMLHttpRequest", "User-Agent": "Mozilla/5.0"}
+# 프록시(cors-anywhere 등) 차단 우회 필수 헤더
+HEADERS = {
+    "x-requested-with": "XMLHttpRequest",
+    "Origin": "http://121.144.101.67:8080",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Content-Type": "application/json",
+}
 
 
 def load_json_file(file_path):
@@ -45,7 +50,7 @@ def root():
     return {"status": "running", "message": "방재실 통합 관제 백엔드 정상 작동 중"}
 
 
-# 1. 1방재실 최신 관제 동기화 (GET도 지원해서 브라우저 주소창에서도 바로 실행 가능!)
+# 1. 1방재실 최신 관제 동기화 (GET/POST 모두 허용)
 @app.api_route("/sync", methods=["GET", "POST"])
 def sync_data():
     try:
@@ -65,9 +70,13 @@ def sync_data():
         }
         res_scs = requests.post(scs_url, json=scs_payload, headers=HEADERS, timeout=20)
         scs_list = []
+        scs_debug = f"status: {res_scs.status_code}, text: {res_scs.text[:200]}"
         if res_scs.status_code == 200:
-            scs_list = res_scs.json().get("list", [])
-            save_json_file(SCS_CACHE_FILE, scs_list)
+            try:
+                scs_list = res_scs.json().get("list", [])
+                save_json_file(SCS_CACHE_FILE, scs_list)
+            except Exception as je:
+                scs_debug += f" (json parse error: {je})"
 
         # ENEX 입출차 로그 동기화 (최근 보름치)
         today_str = datetime.now().strftime("%Y-%m-%d")
@@ -85,15 +94,23 @@ def sync_data():
             enex_url, json=enex_payload, headers=HEADERS, timeout=25
         )
         enex_list = []
+        enex_debug = f"status: {res_enex.status_code}, text: {res_enex.text[:200]}"
         if res_enex.status_code == 200:
-            enex_list = res_enex.json().get("list", [])
-            save_json_file(ENEX_CACHE_FILE, enex_list)
+            try:
+                enex_list = res_enex.json().get("list", [])
+                save_json_file(ENEX_CACHE_FILE, enex_list)
+            except Exception as je:
+                enex_debug += f" (json parse error: {je})"
 
         return {
-            "result": "success",
-            "message": "1방재실 최신 관제 동기화 완료",
+            "result": (
+                "success" if (len(scs_list) > 0 or len(enex_list) > 0) else "warning"
+            ),
+            "message": "1방재실 관제 동기화 시도 완료",
             "scs_count": len(scs_list),
             "enex_count": len(enex_list),
+            "scs_debug": scs_debug,
+            "enex_debug": enex_debug,
         }
     except Exception as e:
         return {"result": "error", "message": str(e)}
