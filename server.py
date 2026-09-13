@@ -46,6 +46,7 @@ def root():
 @app.post("/sync")
 def sync_data():
     try:
+        # SCS 정기/예약 명부 동기화
         scs_url = f"{PROXY_BASE}/scs/get"
         scs_payload = {
             "parkname": "",
@@ -65,6 +66,7 @@ def sync_data():
             scs_list = res_scs.json().get("list", [])
             save_json_file(SCS_CACHE_FILE, scs_list)
 
+        # ENEX 입출차 로그 동기화 (최근 보름치)
         today_str = datetime.now().strftime("%Y-%m-%d")
         enex_url = f"{PROXY_BASE}/enexrcg"
         enex_payload = {
@@ -222,7 +224,7 @@ def search_cars(
     return {"result": "success", "count": len(results), "data": results[:100]}
 
 
-# 3. 아파트너 사전예약 차량 전용 조회 (어제/과거 날짜 로그 복원 지원)
+# 3. 아파트너 사전예약 차량 전용 조회 (어제/과거 날짜 입출차 로그 복원 완벽 지원)
 @app.get("/reserved")
 def get_reserved_cars(
     target_date: str = Query("", description="조회할 날짜 (YYYY-MM-DD, 미지정시 전체)")
@@ -230,6 +232,7 @@ def get_reserved_cars(
     scs_data = load_json_file(SCS_CACHE_FILE)
     enex_data = load_json_file(ENEX_CACHE_FILE)
 
+    clean_target = target_date.replace("-", "").replace("/", "").strip()
     reserved_map = {}
 
     # (1) SCS 명부에서 '아파트너사전예약' 추출
@@ -240,10 +243,15 @@ def get_reserved_cars(
 
         if "아파트너" in grp or "사전예약" in grp or "APTNER" in note or "APT" in grp:
             sdate_full = str(item.get("sdate", "")) or str(item.get("startdate", ""))
+            clean_sdate = (
+                sdate_full.replace("-", "").replace("/", "").split(" ")[0]
+                if sdate_full
+                else ""
+            )
             res_date = sdate_full.split(" ")[0] if sdate_full else ""
 
-            # 날짜 필터가 있고 날짜가 다르면 명부에서는 우선 제외
-            if target_date and res_date and (target_date != res_date):
+            # 날짜 필터가 지정되어 있고 해당 날짜가 아니면 명부 루프에서는 스킵
+            if clean_target and clean_sdate and (clean_target not in clean_sdate):
                 continue
 
             dong = (
@@ -276,7 +284,7 @@ def get_reserved_cars(
                 "last_out_time": "-",
             }
 
-    # (2) ENEX 입출차 로그에서 'APT방문' / '방문권' 대조 및 과거 예약차량 복원
+    # (2) ENEX 입출차 로그에서 'APT방문' / '방문권' 대조 및 과거 만료 차량 복원
     for log in enex_data:
         carno = str(log.get("carno", "")).strip()
         if not carno:
@@ -284,22 +292,27 @@ def get_reserved_cars(
 
         fee = str(log.get("feename", "")) or str(log.get("parkname", ""))
         tkt = str(log.get("tkttypename", ""))
-        io_type = log.get("enextypename", "")
+        io_type = str(log.get("enextypename", "")).strip()
         event_time = str(log.get("enextime", "-"))
         gate = log.get("eqname", "-")
 
+        clean_event = (
+            event_time.replace("-", "").replace("/", "").split(" ")[0]
+            if event_time != "-"
+            else ""
+        )
         log_date = event_time.split(" ")[0] if " " in event_time else ""
         is_apt_visit = (
             "APT" in fee or "방문" in fee or "방문" in tkt or "사전예약" in tkt
         )
 
-        # 날짜 필터가 지정되어 있을 때 해당 일자가 아니면 패스
-        if target_date and log_date and (target_date != log_date):
+        # 날짜 필터가 있고 통과 일자가 해당 날짜가 아니면 패스
+        if clean_target and clean_event and (clean_target not in clean_event):
             continue
 
         if is_apt_visit or carno in reserved_map:
             if carno not in reserved_map:
-                # 명부에서 만료 삭제되었으나 로그상 APT방문으로 들어왔던 과거 차량
+                # 명부에서 이미 삭제된 과거(어제 등) 예약/방문 통과 차량 복원
                 reserved_map[carno] = {
                     "carno": carno,
                     "car_type": "예약",
@@ -332,7 +345,7 @@ def get_reserved_cars(
     }
 
 
-# 4. 스크래치(CCTV) 추적 타임라인
+# 4. 스크래치(CCTV) 추적 전용 실시간 타임라인
 @app.get("/timeline")
 def get_vehicle_timeline(
     carno: str = Query(..., description="차량 전체 번호"),
