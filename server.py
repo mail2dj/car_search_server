@@ -140,6 +140,21 @@ def search_car(
     scs_data = load_json_file(SCS_CACHE_FILE)
     enex_data = load_json_file(ENEX_CACHE_FILE)
 
+    def extract_phone(item):
+        """대영 시스템의 온갖 전화번호 키를 싹 다 뒤져서 반환"""
+        raw = (
+            item.get("phoneno")
+            or item.get("usertel")
+            or item.get("scusertel")
+            or item.get("tel")
+            or item.get("hp")
+            or item.get("mobile")
+            or item.get("cellphone")
+            or item.get("tel1")
+            or ""
+        )
+        return str(raw).strip()
+
     latest_logs = {}
     for item in enex_data:
         c = str(item.get("carno", "")).strip().replace(" ", "")
@@ -150,11 +165,7 @@ def search_car(
         dong = str(item.get("part", "")).strip()
         ho = str(item.get("pos", "")).strip()
         dong_ho = f"{dong}동 {ho}호" if dong and ho else ""
-        phone = (
-            str(item.get("tel") or item.get("hp") or item.get("phone") or "")
-            .replace("-", "")
-            .strip()
-        )
+        phone = extract_phone(item)
         io_type = str(item.get("enextypename") or item.get("io") or "-").strip()
         event_time = str(
             item.get("enexdt") or item.get("entdt") or item.get("enextime") or "-"
@@ -166,7 +177,7 @@ def search_car(
                 "carno": item.get("carno"),
                 "name": s_name,
                 "dong_ho": dong_ho,
-                "phone": phone,
+                "phone": phone if phone else "-",
                 "parking_status": "🟢 주차 중" if io_type == "입차" else "⚪ 출차 완료",
                 "last_event": f"{io_type} ({gate})",
                 "last_time": event_time,
@@ -174,11 +185,12 @@ def search_car(
 
     matched = []
     for c, log in latest_logs.items():
+        clean_phone = log["phone"].replace("-", "")
         if (
             (keyword in c)
             or (log["name"] and keyword in log["name"])
             or (keyword in log["dong_ho"].replace(" ", ""))
-            or (log["phone"] and keyword in log["phone"])
+            or (clean_phone and keyword in clean_phone)
         ):
             matched.append(log)
 
@@ -197,24 +209,21 @@ def search_car(
         ho = str(item.get("pos", "") or item.get("ho", "")).strip()
         org = str(item.get("org", "")).strip()
         dong_ho = f"{dong}동 {ho}호" if dong and ho else (org if org else "-")
-        tel = (
-            str(item.get("tel") or item.get("usertel") or item.get("scusertel") or "")
-            .replace("-", "")
-            .strip()
-        )
+        phone = extract_phone(item)
+        clean_phone = phone.replace("-", "")
 
         if (
             (keyword in c.replace(" ", ""))
             or (u_name and keyword in u_name)
             or (keyword in dong_ho.replace(" ", ""))
-            or (tel and keyword in tel)
+            or (clean_phone and keyword in clean_phone)
         ):
             matched.append(
                 {
                     "carno": c,
                     "name": u_name if u_name else "-",
                     "dong_ho": dong_ho,
-                    "phone": tel if tel else "-",
+                    "phone": phone if phone else "-",
                     "parking_status": "출차 완료",
                     "last_event": "-",
                     "last_time": "-",
