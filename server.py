@@ -263,7 +263,7 @@ def get_reserved_cars(
         }
 
 
-# 3. 아파트너 예약차량 목록 (실제 키 + 7만건 입출차 기록으로 주차 상태 완벽 매핑)
+## 3. 아파트너 예약차량 목록 (UTC/KST 시차 방어 및 전체 조회 보장)
 @app.get("/reserved")
 def get_reserved_cars(
     target_date: str = Query("", description="조회일자 (YYYY-MM-DD, 미지정시 전체)")
@@ -272,7 +272,7 @@ def get_reserved_cars(
     enex_data = load_json_file(ENEX_CACHE_FILE)
     clean_target = target_date.replace("-", "").strip()
 
-    # 1) 입출차 7만건 기록에서 최신 통과 상태 정리
+    # 1) 입출차 기록에서 통과 상태 맵 생성
     enex_status_map = {}
     for log in enex_data:
         c = str(log.get("carno", "")).strip().replace(" ", "")
@@ -290,18 +290,25 @@ def get_reserved_cars(
             "last_time": event_time,
         }
 
-    # 2) 아파트너 예약차량 매핑
+    # 2) 아파트너 예약차량 추출
     results = []
     for item in scs_data:
         sc_user = str(item.get("scusername", ""))
         msg = str(item.get("msg", ""))
         memo = str(item.get("memo", ""))
 
-        if "아파트너사전예약" in sc_user or "APTNER" in msg or "아파트너" in memo:
+        # 예약 차량 판별
+        if (
+            "아파트너사전예약" in sc_user
+            or "APTNER" in msg
+            or "아파트너" in memo
+            or "사전예약" in sc_user
+        ):
             bgn = str(item.get("usebgndt", ""))
             clean_bgn = bgn.replace("-", "").split(" ")[0] if bgn else ""
             res_date = bgn.split(" ")[0] if bgn else "-"
 
+            # 파라미터로 특정 날짜를 명시했을 때만 날짜 필터링 (미지정시 전체 다 보여줌!)
             if clean_target and clean_bgn and (clean_target not in clean_bgn):
                 continue
 
@@ -313,7 +320,7 @@ def get_reserved_cars(
             carno = item.get("carno", "-")
             clean_carno = carno.replace(" ", "")
 
-            # 입출차 기록 대조
+            # 상태 대조
             log_info = enex_status_map.get(clean_carno, {})
             p_status = log_info.get("status", "입차 대기")
             l_event = log_info.get("last_event", "-")
