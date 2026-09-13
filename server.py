@@ -1,356 +1,444 @@
-import os
-import json
-import requests
-from datetime import datetime
-from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
+# 3. 아파트너 사전예약 차량 전용 조회 (날짜 필터 + 동호수 정밀 매칭)
+@app.get("/reserved")
+def get_reserved_cars(
+    target_date: str = Query(
+        "", description="조회할 날짜 (YYYY-MM-DD, 비어있으면 전체)"
+    )
+):
+    scs_data = load_json_file(SCS_CACHE_FILE)
+    enex_data = load_json_file(ENEX_CACHE_FILE)
 
-app = FastAPI(title="방재실 차량 관제 통합 API")
+    reserved_map = {}
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+    # (1) SCS 명부에서 아파트너 예약 차량 추출 및 동·호수 완벽 파싱
+    for item in scs_data:
+        grp = str(item.get("scsttypename", ""))
+        note = str(item.get("memo", "")) or str(item.get("remk", ""))
+        carno = str(item.get("carno", "")).strip()
 
-LOCAL_FILE = "enex_log.json"
-EXTERNAL_IP = "121.144.101.67"
-BASE_PROXY = f"http://{EXTERNAL_IP}:8080/http://192.168.100.10:9935"
-SCS_URL = f"{BASE_PROXY}/scs/get"
-ENEX_URL = f"{BASE_PROXY}/enexrcg"
+        if "아파트너" in grp or "사전예약" in grp or "APTNER" in note or "APT" in grp:
+            # 시작일시 체크 (예: "2026-09-13 12:00:00" -> "2026-09-13")
+            sdate_full = str(item.get("sdate", "")) or str(item.get("startdate", ""))
+            res_date = sdate_full.split(" ")[0] if sdate_full else ""
 
-AUTH_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIwMjQyMDY0ODgiLCJuYW1lIjoiaHR0cDovL3d3dy5keWlrMjEuY28ua3IvIiwidmlzaW9uIjoidjQifQ.FWrZJsSj3ElO7tSp4QHMDM5TJ5HsvTyuJK0ByzSv1Q8"
+            # 날짜 필터가 들어온 경우 해당 날짜 예약만 필터링
+            if target_date and res_date and (target_date != res_date):
+                continue
 
-headers = {
-    "Accept": "application/json, text/javascript, */*; q=0.01",
-    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Authorization": AUTH_TOKEN,
-    "Connection": "close",
-    "Content-Type": "application/json",
-    "Origin": "http://192.168.100.10:84",
-    "Referer": "http://192.168.100.10:84/",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-}
+            # 동-호수 완벽 추출 (org: '203-1402', part: '203', pos: '1402')
+            dong = (
+                str(item.get("part", "")).strip() or str(item.get("dong", "")).strip()
+            )
+            ho = str(item.get("pos", "")).strip() or str(item.get("ho", "")).strip()
+            org = str(item.get("org", "")).strip()  # '203-1402' 형태로 들어오는 필드
 
+            if dong and ho:
+                dong_ho = f"{dong}동 {ho}호"
+            elif org and "-" in org:
+                parts = org.split("-")
+                dong_ho = f"{parts[0]}동 {parts[1]}호"
+            elif org:
+                dong_ho = org
+            else:
+                dong_ho = "동호수 미기재"
 
-def fetch_and_merge_data():
-    # 1. 정기차량 명부 수집
-    scs_payload = {
-        "parkname": "",
-        "carno": "",
-        "username": "",
-        "org": "",
-        "part": "",
-        "pos": "",
-        "scuserid": "",
-        "scsttypeid": "",
-        "shopid": "",
-        "carexist": 0,
-    }
-    try:
-        r_scs = requests.post(SCS_URL, headers=headers, json=scs_payload, timeout=30)
-        scs_data = (
-            r_scs.json() if (r_scs.status_code == 200 and len(r_scs.text) > 100) else []
-        )
-    except Exception as e:
-        print(f"❌ 명부 에러: {e}")
-        scs_data = []
-
-    # 2. 최근 입출차 로그 수집 (전체 동기화용)
-    now_str = datetime.now().strftime("%Y-%m-%dT23:59:59")
-    enex_payload = {
-        "parkno": "",
-        "bgndt": "2026-09-01T00:00:00",
-        "enddt": now_str,
-        "carno": "",
-        "enextypeid": "",
-        "tkttypeid": "",
-        "eqno": "",
-    }
-    try:
-        r_enex = requests.post(ENEX_URL, headers=headers, json=enex_payload, timeout=30)
-        enex_data = (
-            r_enex.json()
-            if (r_enex.status_code == 200 and len(r_enex.text) > 100)
-            else []
-        )
-    except Exception as e:
-        print(f"❌ 입출차 에러: {e}")
-        enex_data = []
-
-    car_events = {}
-    for item in sorted(
-        enex_data,
-        key=lambda x: str(x.get("enexdt") or x.get("entdt") or x.get("io_time") or ""),
-    ):
-        c_clean = str(item.get("carno") or "").strip().replace(" ", "")
-        if not c_clean:
-            continue
-
-        io_name = str(
-            item.get("enextypename") or item.get("etname") or item.get("io") or ""
-        )
-        io_id = str(item.get("enextypeid") or "")
-        is_out = (
-            "출차" in io_name or io_id == "2" or "출" in str(item.get("eqname") or "")
-        )
-        ev_time = str(
-            item.get("enexdt") or item.get("entdt") or item.get("io_time") or ""
-        ).replace("T", " ")
-        gate = item.get("eqname") or item.get("parkname") or "-"
-
-        tkt_name = str(
-            item.get("tkttypename")
-            or item.get("tktname")
-            or item.get("enextypename")
-            or ""
-        )
-        is_reservation = (
-            ("예약" in tkt_name)
-            or ("방문" in tkt_name and "예약" in str(item))
-            or (str(item.get("tkttypeid")) in ["3", "4", "5"])
-        )
-
-        if c_clean not in car_events:
-            car_events[c_clean] = {
-                "logs": [],
+            reserved_map[carno] = {
+                "carno": carno,
+                "car_type": "예약",
+                "name": item.get("username", "-") or "방문예약",
+                "phone": item.get("usertel", "-") or "-",
+                "dong_ho": dong_ho,
+                "res_date": res_date,
+                "tkt_name": grp,
+                "parking_status": "입차 대기",
+                "last_event": "-",
                 "last_in_time": "-",
                 "last_out_time": "-",
-                "is_out": True,
-                "last_event": "-",
-                "last_time": "-",
-                "is_reserved": False,
-                "tkt_name": tkt_name,
             }
 
-        if is_reservation:
-            car_events[c_clean]["is_reserved"] = True
+    # (2) ENEX 입출차 로그와 매칭하여 실시간 주차 상태 반영
+    for log in enex_data:
+        carno = str(log.get("carno", "")).strip()
+        io_type = log.get("enextypename", "")
+        event_time = log.get("enextime", "-")
+        gate = log.get("eqname", "-")
+        fee = str(log.get("feename", "")) or str(log.get("parkname", ""))
+        tkt = str(log.get("tkttypename", ""))
 
-        event_label = "출차" if is_out else "입차"
-        if is_out:
-            car_events[c_clean]["last_out_time"] = ev_time
-            car_events[c_clean]["is_out"] = True
-            car_events[c_clean]["last_event"] = f"출차 ({gate})"
-        else:
-            car_events[c_clean]["last_in_time"] = ev_time
-            car_events[c_clean]["is_out"] = False
-            car_events[c_clean]["last_event"] = f"입차 ({gate})"
+        if carno in reserved_map:
+            target = reserved_map[carno]
+            target["last_event"] = f"{io_type} ({gate})"
+            if io_type == "입차":
+                target["parking_status"] = "주차 중"
+                target["last_in_time"] = event_time
+            elif io_type == "출차":
+                target["parking_status"] = "출차 완료"
+                target["last_out_time"] = event_time
 
-        car_events[c_clean]["last_time"] = ev_time
-        car_events[c_clean]["logs"].append(
-            {"time": ev_time, "gate": gate, "type": event_label, "tkt": tkt_name}
-        )
-
-    final_records = []
-    seen = set()
-
-    for s in scs_data:
-        raw_c = str(s.get("carno") or "").strip()
-        c_clean = raw_c.replace(" ", "")
-        if not c_clean:
-            continue
-        seen.add(c_clean)
-
-        dong = str(s.get("part") or "").strip()
-        ho = str(s.get("pos") or "").strip()
-        dong_ho = f"{dong}동 {ho}호".strip() if (dong or ho) else "-"
-        car_info = car_events.get(c_clean, {})
-
-        final_records.append(
-            {
-                "carno": raw_c,
-                "name": str(s.get("name") or s.get("username") or "-").strip(),
-                "dong_ho": dong_ho,
-                "phone": str(s.get("tel") or s.get("hp") or s.get("phone") or "-")
-                .replace("-", "")
-                .strip(),
-                "parking_status": (
-                    "⚪ 출차 완료" if car_info.get("is_out", True) else "🟢 주차 중"
-                ),
-                "car_type": "정기",
-                "tkt_name": car_info.get("tkt_name", "정기차량"),
-                "last_event": car_info.get("last_event", "-"),
-                "last_in_time": car_info.get("last_in_time", "-"),
-                "last_out_time": car_info.get("last_out_time", "-"),
-                "last_time": car_info.get("last_time", "-"),
-                "history": car_info.get("logs", []),
-            }
-        )
-
-    for c_clean, car_info in car_events.items():
-        if c_clean not in seen:
-            car_type = "예약" if car_info["is_reserved"] else "일반"
-            final_records.append(
-                {
-                    "carno": c_clean,
-                    "name": "-",
-                    "dong_ho": "-",
-                    "phone": "-",
-                    "parking_status": (
-                        "⚪ 출차 완료" if car_info["is_out"] else "🟢 주차 중"
-                    ),
-                    "car_type": car_type,
-                    "tkt_name": car_info.get("tkt_name", "일반방문"),
-                    "last_event": car_info["last_event"],
-                    "last_in_time": car_info["last_in_time"],
-                    "last_out_time": car_info["last_out_time"],
-                    "last_time": car_info["last_time"],
-                    "history": car_info["logs"],
-                }
-            )
-
-    with open(LOCAL_FILE, "w", encoding="utf-8") as f:
-        json.dump(final_records, f, ensure_ascii=False, indent=2)
-
-    return len(final_records)
-
-
-@app.get("/")
-def root():
-    return {"status": "ok", "message": "방재실 차량 관제 API"}
-
-
-@app.post("/sync")
-def sync_trigger():
-    cnt = fetch_and_merge_data()
-    return {"result": "success", "message": f"{cnt}건 동기화 완료", "count": cnt}
-
-
-@app.get("/search")
-def search_car(q: str = Query(..., description="차량번호, 동호수, 성명, 연락처")):
-    query = q.strip().replace(" ", "").replace("-", "")
-    if not os.path.exists(LOCAL_FILE):
-        return {
-            "result": "error",
-            "message": "동기화 파일이 없습니다. /sync를 실행하세요.",
-        }
-
-    with open(LOCAL_FILE, "r", encoding="utf-8") as f:
-        records = json.load(f)
-
-    matched = []
-    for item in records:
-        carno = str(item.get("carno", "")).replace(" ", "")
-        name = str(item.get("name", "")).strip()
-        dong_ho = str(item.get("dong_ho", "")).replace(" ", "").replace("-", "")
-        phone = str(item.get("phone", "")).replace("-", "").strip()
-
-        if (
-            (query in carno)
-            or (query in name)
-            or (query in dong_ho)
-            or (phone != "-" and query in phone)
-        ):
-            matched.append(item)
-
-    return {"result": "success", "count": len(matched), "data": matched}
-
-
-# 방문 예약차량 목록 추출 전용 엔드포인트
-@app.get("/reserved")
-def get_reserved_cars():
-    if not os.path.exists(LOCAL_FILE):
-        return {"result": "error", "message": "동기화 파일이 없습니다."}
-
-    with open(LOCAL_FILE, "r", encoding="utf-8") as f:
-        records = json.load(f)
-
-    # 예약차량만 필터링
-    reserved_list = [item for item in records if item.get("car_type") == "예약"]
-    # 최근 활동순 정렬
-    reserved_list.sort(key=lambda x: str(x.get("last_time", "")), reverse=True)
-
-    return {"result": "success", "count": len(reserved_list), "data": reserved_list}
-
-
-# 스크래치 추적용: 차량 풀번호 + 임의 기간(From ~ To) 관제 PC 실시간 단건 조회 (부하 0%)
-@app.get("/history/live")
-def get_live_car_history(
-    carno: str = Query(..., description="차량 풀번호 (예: 04수0572)"),
-    start_date: str = Query(..., description="시작일 YYYY-MM-DD"),
-    end_date: str = Query(..., description="종료일 YYYY-MM-DD"),
-):
-    clean_car = carno.strip().replace(" ", "")
-    bgndt = f"{start_date}T00:00:00"
-    enddt = f"{end_date}T23:59:59"
-
-    payload = {
-        "parkno": "",
-        "bgndt": bgndt,
-        "enddt": enddt,
-        "carno": clean_car,
-        "enextypeid": "",
-        "tkttypeid": "",
-        "eqno": "",
+    results = list(reserved_map.values())
+    return {
+        "result": "success",
+        "target_date": target_date or "전체",
+        "count": len(results),
+        "data": results,
     }
 
-    try:
-        r = requests.post(ENEX_URL, headers=headers, json=payload, timeout=10)
-        if r.status_code != 200:
-            return {
-                "result": "error",
-                "message": f"관제 서버 응답 에러 ({r.status_code})",
-            }
 
-        data = r.json()
-        if not isinstance(data, list) or len(data) == 0:
-            return {
-                "result": "success",
-                "count": 0,
-                "data": [],
-                "message": "해당 기간 내 입출차 기록이 없습니다.",
-            }
+# import os
+# import json
+# import requests
+# from datetime import datetime
+# from fastapi import FastAPI, Query
+# from fastapi.middleware.cors import CORSMiddleware
 
-        logs = []
-        for item in data:
-            io_name = str(
-                item.get("enextypename") or item.get("etname") or item.get("io") or ""
-            )
-            io_id = str(item.get("enextypeid") or "")
-            is_out = (
-                "출차" in io_name
-                or io_id == "2"
-                or "출" in str(item.get("eqname") or "")
-            )
-            ev_time = str(
-                item.get("enexdt") or item.get("entdt") or item.get("io_time") or ""
-            ).replace("T", " ")
-            gate = item.get("eqname") or item.get("parkname") or "-"
-            tkt_name = str(
-                item.get("tkttypename")
-                or item.get("tktname")
-                or item.get("enextypename")
-                or "-"
-            )
+# app = FastAPI(title="방재실 차량 관제 통합 API")
 
-            logs.append(
-                {
-                    "time": ev_time,
-                    "type": "출차" if is_out else "입차",
-                    "gate": gate,
-                    "tkt": tkt_name,
-                }
-            )
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=["*"],
+#     allow_credentials=True,
+#     allow_methods=["*"],
+#     allow_headers=["*"],
+# )
 
-        logs.sort(key=lambda x: x["time"], reverse=True)
-        return {
-            "result": "success",
-            "carno": clean_car,
-            "count": len(logs),
-            "data": logs,
-        }
+# LOCAL_FILE = "enex_log.json"
+# EXTERNAL_IP = "121.144.101.67"
+# BASE_PROXY = f"http://{EXTERNAL_IP}:8080/http://192.168.100.10:9935"
+# SCS_URL = f"{BASE_PROXY}/scs/get"
+# ENEX_URL = f"{BASE_PROXY}/enexrcg"
 
-    except Exception as e:
-        return {"result": "error", "message": f"조회 중 오류 발생: {e}"}
+# AUTH_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIwMjQyMDY0ODgiLCJuYW1lIjoiaHR0cDovL3d3dy5keWlrMjEuY28ua3IvIiwidmlzaW9uIjoidjQifQ.FWrZJsSj3ElO7tSp4QHMDM5TJ5HsvTyuJK0ByzSv1Q8"
+
+# headers = {
+#     "Accept": "application/json, text/javascript, */*; q=0.01",
+#     "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+#     "Authorization": AUTH_TOKEN,
+#     "Connection": "close",
+#     "Content-Type": "application/json",
+#     "Origin": "http://192.168.100.10:84",
+#     "Referer": "http://192.168.100.10:84/",
+#     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+# }
 
 
-if __name__ == "__main__":
-    import uvicorn
+# def fetch_and_merge_data():
+#     # 1. 정기차량 명부 수집
+#     scs_payload = {
+#         "parkname": "",
+#         "carno": "",
+#         "username": "",
+#         "org": "",
+#         "part": "",
+#         "pos": "",
+#         "scuserid": "",
+#         "scsttypeid": "",
+#         "shopid": "",
+#         "carexist": 0,
+#     }
+#     try:
+#         r_scs = requests.post(SCS_URL, headers=headers, json=scs_payload, timeout=30)
+#         scs_data = (
+#             r_scs.json() if (r_scs.status_code == 200 and len(r_scs.text) > 100) else []
+#         )
+#     except Exception as e:
+#         print(f"❌ 명부 에러: {e}")
+#         scs_data = []
 
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("server:app", host="0.0.0.0", port=port)
+#     # 2. 최근 입출차 로그 수집 (전체 동기화용)
+#     now_str = datetime.now().strftime("%Y-%m-%dT23:59:59")
+#     enex_payload = {
+#         "parkno": "",
+#         "bgndt": "2026-09-01T00:00:00",
+#         "enddt": now_str,
+#         "carno": "",
+#         "enextypeid": "",
+#         "tkttypeid": "",
+#         "eqno": "",
+#     }
+#     try:
+#         r_enex = requests.post(ENEX_URL, headers=headers, json=enex_payload, timeout=30)
+#         enex_data = (
+#             r_enex.json()
+#             if (r_enex.status_code == 200 and len(r_enex.text) > 100)
+#             else []
+#         )
+#     except Exception as e:
+#         print(f"❌ 입출차 에러: {e}")
+#         enex_data = []
+
+#     car_events = {}
+#     for item in sorted(
+#         enex_data,
+#         key=lambda x: str(x.get("enexdt") or x.get("entdt") or x.get("io_time") or ""),
+#     ):
+#         c_clean = str(item.get("carno") or "").strip().replace(" ", "")
+#         if not c_clean:
+#             continue
+
+#         io_name = str(
+#             item.get("enextypename") or item.get("etname") or item.get("io") or ""
+#         )
+#         io_id = str(item.get("enextypeid") or "")
+#         is_out = (
+#             "출차" in io_name or io_id == "2" or "출" in str(item.get("eqname") or "")
+#         )
+#         ev_time = str(
+#             item.get("enexdt") or item.get("entdt") or item.get("io_time") or ""
+#         ).replace("T", " ")
+#         gate = item.get("eqname") or item.get("parkname") or "-"
+
+#         tkt_name = str(
+#             item.get("tkttypename")
+#             or item.get("tktname")
+#             or item.get("enextypename")
+#             or ""
+#         )
+#         is_reservation = (
+#             ("예약" in tkt_name)
+#             or ("방문" in tkt_name and "예약" in str(item))
+#             or (str(item.get("tkttypeid")) in ["3", "4", "5"])
+#         )
+
+#         if c_clean not in car_events:
+#             car_events[c_clean] = {
+#                 "logs": [],
+#                 "last_in_time": "-",
+#                 "last_out_time": "-",
+#                 "is_out": True,
+#                 "last_event": "-",
+#                 "last_time": "-",
+#                 "is_reserved": False,
+#                 "tkt_name": tkt_name,
+#             }
+
+#         if is_reservation:
+#             car_events[c_clean]["is_reserved"] = True
+
+#         event_label = "출차" if is_out else "입차"
+#         if is_out:
+#             car_events[c_clean]["last_out_time"] = ev_time
+#             car_events[c_clean]["is_out"] = True
+#             car_events[c_clean]["last_event"] = f"출차 ({gate})"
+#         else:
+#             car_events[c_clean]["last_in_time"] = ev_time
+#             car_events[c_clean]["is_out"] = False
+#             car_events[c_clean]["last_event"] = f"입차 ({gate})"
+
+#         car_events[c_clean]["last_time"] = ev_time
+#         car_events[c_clean]["logs"].append(
+#             {"time": ev_time, "gate": gate, "type": event_label, "tkt": tkt_name}
+#         )
+
+#     final_records = []
+#     seen = set()
+
+#     for s in scs_data:
+#         raw_c = str(s.get("carno") or "").strip()
+#         c_clean = raw_c.replace(" ", "")
+#         if not c_clean:
+#             continue
+#         seen.add(c_clean)
+
+#         dong = str(s.get("part") or "").strip()
+#         ho = str(s.get("pos") or "").strip()
+#         dong_ho = f"{dong}동 {ho}호".strip() if (dong or ho) else "-"
+#         car_info = car_events.get(c_clean, {})
+
+#         final_records.append(
+#             {
+#                 "carno": raw_c,
+#                 "name": str(s.get("name") or s.get("username") or "-").strip(),
+#                 "dong_ho": dong_ho,
+#                 "phone": str(s.get("tel") or s.get("hp") or s.get("phone") or "-")
+#                 .replace("-", "")
+#                 .strip(),
+#                 "parking_status": (
+#                     "⚪ 출차 완료" if car_info.get("is_out", True) else "🟢 주차 중"
+#                 ),
+#                 "car_type": "정기",
+#                 "tkt_name": car_info.get("tkt_name", "정기차량"),
+#                 "last_event": car_info.get("last_event", "-"),
+#                 "last_in_time": car_info.get("last_in_time", "-"),
+#                 "last_out_time": car_info.get("last_out_time", "-"),
+#                 "last_time": car_info.get("last_time", "-"),
+#                 "history": car_info.get("logs", []),
+#             }
+#         )
+
+#     for c_clean, car_info in car_events.items():
+#         if c_clean not in seen:
+#             car_type = "예약" if car_info["is_reserved"] else "일반"
+#             final_records.append(
+#                 {
+#                     "carno": c_clean,
+#                     "name": "-",
+#                     "dong_ho": "-",
+#                     "phone": "-",
+#                     "parking_status": (
+#                         "⚪ 출차 완료" if car_info["is_out"] else "🟢 주차 중"
+#                     ),
+#                     "car_type": car_type,
+#                     "tkt_name": car_info.get("tkt_name", "일반방문"),
+#                     "last_event": car_info["last_event"],
+#                     "last_in_time": car_info["last_in_time"],
+#                     "last_out_time": car_info["last_out_time"],
+#                     "last_time": car_info["last_time"],
+#                     "history": car_info["logs"],
+#                 }
+#             )
+
+#     with open(LOCAL_FILE, "w", encoding="utf-8") as f:
+#         json.dump(final_records, f, ensure_ascii=False, indent=2)
+
+#     return len(final_records)
+
+
+# @app.get("/")
+# def root():
+#     return {"status": "ok", "message": "방재실 차량 관제 API"}
+
+
+# @app.post("/sync")
+# def sync_trigger():
+#     cnt = fetch_and_merge_data()
+#     return {"result": "success", "message": f"{cnt}건 동기화 완료", "count": cnt}
+
+
+# @app.get("/search")
+# def search_car(q: str = Query(..., description="차량번호, 동호수, 성명, 연락처")):
+#     query = q.strip().replace(" ", "").replace("-", "")
+#     if not os.path.exists(LOCAL_FILE):
+#         return {
+#             "result": "error",
+#             "message": "동기화 파일이 없습니다. /sync를 실행하세요.",
+#         }
+
+#     with open(LOCAL_FILE, "r", encoding="utf-8") as f:
+#         records = json.load(f)
+
+#     matched = []
+#     for item in records:
+#         carno = str(item.get("carno", "")).replace(" ", "")
+#         name = str(item.get("name", "")).strip()
+#         dong_ho = str(item.get("dong_ho", "")).replace(" ", "").replace("-", "")
+#         phone = str(item.get("phone", "")).replace("-", "").strip()
+
+#         if (
+#             (query in carno)
+#             or (query in name)
+#             or (query in dong_ho)
+#             or (phone != "-" and query in phone)
+#         ):
+#             matched.append(item)
+
+#     return {"result": "success", "count": len(matched), "data": matched}
+
+
+# # 방문 예약차량 목록 추출 전용 엔드포인트
+# @app.get("/reserved")
+# def get_reserved_cars():
+#     if not os.path.exists(LOCAL_FILE):
+#         return {"result": "error", "message": "동기화 파일이 없습니다."}
+
+#     with open(LOCAL_FILE, "r", encoding="utf-8") as f:
+#         records = json.load(f)
+
+#     # 예약차량만 필터링
+#     reserved_list = [item for item in records if item.get("car_type") == "예약"]
+#     # 최근 활동순 정렬
+#     reserved_list.sort(key=lambda x: str(x.get("last_time", "")), reverse=True)
+
+#     return {"result": "success", "count": len(reserved_list), "data": reserved_list}
+
+
+# # 스크래치 추적용: 차량 풀번호 + 임의 기간(From ~ To) 관제 PC 실시간 단건 조회 (부하 0%)
+# @app.get("/history/live")
+# def get_live_car_history(
+#     carno: str = Query(..., description="차량 풀번호 (예: 04수0572)"),
+#     start_date: str = Query(..., description="시작일 YYYY-MM-DD"),
+#     end_date: str = Query(..., description="종료일 YYYY-MM-DD"),
+# ):
+#     clean_car = carno.strip().replace(" ", "")
+#     bgndt = f"{start_date}T00:00:00"
+#     enddt = f"{end_date}T23:59:59"
+
+#     payload = {
+#         "parkno": "",
+#         "bgndt": bgndt,
+#         "enddt": enddt,
+#         "carno": clean_car,
+#         "enextypeid": "",
+#         "tkttypeid": "",
+#         "eqno": "",
+#     }
+
+#     try:
+#         r = requests.post(ENEX_URL, headers=headers, json=payload, timeout=10)
+#         if r.status_code != 200:
+#             return {
+#                 "result": "error",
+#                 "message": f"관제 서버 응답 에러 ({r.status_code})",
+#             }
+
+#         data = r.json()
+#         if not isinstance(data, list) or len(data) == 0:
+#             return {
+#                 "result": "success",
+#                 "count": 0,
+#                 "data": [],
+#                 "message": "해당 기간 내 입출차 기록이 없습니다.",
+#             }
+
+#         logs = []
+#         for item in data:
+#             io_name = str(
+#                 item.get("enextypename") or item.get("etname") or item.get("io") or ""
+#             )
+#             io_id = str(item.get("enextypeid") or "")
+#             is_out = (
+#                 "출차" in io_name
+#                 or io_id == "2"
+#                 or "출" in str(item.get("eqname") or "")
+#             )
+#             ev_time = str(
+#                 item.get("enexdt") or item.get("entdt") or item.get("io_time") or ""
+#             ).replace("T", " ")
+#             gate = item.get("eqname") or item.get("parkname") or "-"
+#             tkt_name = str(
+#                 item.get("tkttypename")
+#                 or item.get("tktname")
+#                 or item.get("enextypename")
+#                 or "-"
+#             )
+
+#             logs.append(
+#                 {
+#                     "time": ev_time,
+#                     "type": "출차" if is_out else "입차",
+#                     "gate": gate,
+#                     "tkt": tkt_name,
+#                 }
+#             )
+
+#         logs.sort(key=lambda x: x["time"], reverse=True)
+#         return {
+#             "result": "success",
+#             "carno": clean_car,
+#             "count": len(logs),
+#             "data": logs,
+#         }
+
+#     except Exception as e:
+#         return {"result": "error", "message": f"조회 중 오류 발생: {e}"}
+
+
+# if __name__ == "__main__":
+#     import uvicorn
+
+#     port = int(os.environ.get("PORT", 8000))
+#     uvicorn.run("server:app", host="0.0.0.0", port=port)
+
+
 # import json
 # import os
 # from fastapi import FastAPI, Query
