@@ -21,6 +21,9 @@ ENEX_CACHE_FILE = os.path.join(BASE_DIR, "enex_log.json")
 
 PROXY_BASE = "http://121.144.101.67:8080/http://192.168.100.10:9935"
 
+# ★ 프록시 차단 우회 필수 헤더!
+HEADERS = {"x-requested-with": "XMLHttpRequest", "User-Agent": "Mozilla/5.0"}
+
 
 def load_json_file(file_path):
     if os.path.exists(file_path):
@@ -42,8 +45,8 @@ def root():
     return {"status": "running", "message": "방재실 통합 관제 백엔드 정상 작동 중"}
 
 
-# 1. 1방재실 최신 관제 동기화 (Sync)
-@app.post("/sync")
+# 1. 1방재실 최신 관제 동기화 (GET도 지원해서 브라우저 주소창에서도 바로 실행 가능!)
+@app.api_route("/sync", methods=["GET", "POST"])
 def sync_data():
     try:
         # SCS 정기/예약 명부 동기화
@@ -60,7 +63,7 @@ def sync_data():
             "shopid": "",
             "carexist": 0,
         }
-        res_scs = requests.post(scs_url, json=scs_payload, timeout=20)
+        res_scs = requests.post(scs_url, json=scs_payload, headers=HEADERS, timeout=20)
         scs_list = []
         if res_scs.status_code == 200:
             scs_list = res_scs.json().get("list", [])
@@ -78,7 +81,9 @@ def sync_data():
             "enextypename": "",
             "tkttypename": "",
         }
-        res_enex = requests.post(enex_url, json=enex_payload, timeout=25)
+        res_enex = requests.post(
+            enex_url, json=enex_payload, headers=HEADERS, timeout=25
+        )
         enex_list = []
         if res_enex.status_code == 200:
             enex_list = res_enex.json().get("list", [])
@@ -224,7 +229,7 @@ def search_cars(
     return {"result": "success", "count": len(results), "data": results[:100]}
 
 
-# 3. 아파트너 사전예약 차량 전용 조회 (어제/과거 날짜 입출차 로그 복원 완벽 지원)
+# 3. 아파트너 사전예약 차량 전용 조회
 @app.get("/reserved")
 def get_reserved_cars(
     target_date: str = Query("", description="조회할 날짜 (YYYY-MM-DD, 미지정시 전체)")
@@ -250,7 +255,6 @@ def get_reserved_cars(
             )
             res_date = sdate_full.split(" ")[0] if sdate_full else ""
 
-            # 날짜 필터가 지정되어 있고 해당 날짜가 아니면 명부 루프에서는 스킵
             if clean_target and clean_sdate and (clean_target not in clean_sdate):
                 continue
 
@@ -306,13 +310,11 @@ def get_reserved_cars(
             "APT" in fee or "방문" in fee or "방문" in tkt or "사전예약" in tkt
         )
 
-        # 날짜 필터가 있고 통과 일자가 해당 날짜가 아니면 패스
         if clean_target and clean_event and (clean_target not in clean_event):
             continue
 
         if is_apt_visit or carno in reserved_map:
             if carno not in reserved_map:
-                # 명부에서 이미 삭제된 과거(어제 등) 예약/방문 통과 차량 복원
                 reserved_map[carno] = {
                     "carno": carno,
                     "car_type": "예약",
@@ -345,7 +347,7 @@ def get_reserved_cars(
     }
 
 
-# 4. 스크래치(CCTV) 추적 전용 실시간 타임라인
+# 4. 스크래치(CCTV) 추적 실시간 타임라인
 @app.get("/timeline")
 def get_vehicle_timeline(
     carno: str = Query(..., description="차량 전체 번호"),
@@ -363,7 +365,7 @@ def get_vehicle_timeline(
             "enextypename": "",
             "tkttypename": "",
         }
-        res = requests.post(url, json=payload, timeout=15)
+        res = requests.post(url, json=payload, headers=HEADERS, timeout=15)
         if res.status_code == 200:
             logs = res.json().get("list", [])
             timeline = []
