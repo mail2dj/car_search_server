@@ -263,16 +263,13 @@ def get_reserved_cars(
         }
 
 
-## 3. 아파트너 예약차량 목록 (UTC/KST 시차 방어 및 전체 조회 보장)
+# 3. 아파트너 예약차량 목록
 @app.get("/reserved")
-def get_reserved_cars(
-    target_date: str = Query("", description="조회일자 (YYYY-MM-DD, 미지정시 전체)")
-):
+def get_reserved_cars(target_date: str = Query("", description="조회일자")):
     scs_data = load_json_file(SCS_CACHE_FILE)
     enex_data = load_json_file(ENEX_CACHE_FILE)
     clean_target = target_date.replace("-", "").strip()
 
-    # 1) 입출차 기록에서 통과 상태 맵 생성
     enex_status_map = {}
     for log in enex_data:
         c = str(log.get("carno", "")).strip().replace(" ", "")
@@ -290,14 +287,12 @@ def get_reserved_cars(
             "last_time": event_time,
         }
 
-    # 2) 아파트너 예약차량 추출
     results = []
     for item in scs_data:
         sc_user = str(item.get("scusername", ""))
         msg = str(item.get("msg", ""))
         memo = str(item.get("memo", ""))
 
-        # 예약 차량 판별
         if (
             "아파트너사전예약" in sc_user
             or "APTNER" in msg
@@ -308,7 +303,6 @@ def get_reserved_cars(
             clean_bgn = bgn.replace("-", "").split(" ")[0] if bgn else ""
             res_date = bgn.split(" ")[0] if bgn else "-"
 
-            # 파라미터로 특정 날짜를 명시했을 때만 날짜 필터링 (미지정시 전체 다 보여줌!)
             if clean_target and clean_bgn and (clean_target not in clean_bgn):
                 continue
 
@@ -317,10 +311,9 @@ def get_reserved_cars(
             org = str(item.get("org", "")).strip()
             dong_ho = f"{dong}동 {ho}호" if (dong and ho) else (org if org else "-")
 
-            carno = item.get("carno", "-")
+            carno = str(item.get("carno", "-"))
             clean_carno = carno.replace(" ", "")
 
-            # 상태 대조
             log_info = enex_status_map.get(clean_carno, {})
             p_status = log_info.get("status", "입차 대기")
             l_event = log_info.get("last_event", "-")
@@ -331,7 +324,7 @@ def get_reserved_cars(
                     "carno": carno,
                     "car_type": "예약",
                     "name": "아파트너사전예약",
-                    "phone": item.get("tel", "") or "-",
+                    "phone": str(item.get("tel", "") or "-"),
                     "dong_ho": dong_ho,
                     "res_date": res_date,
                     "start_time": item.get("usebgndt", "-"),
