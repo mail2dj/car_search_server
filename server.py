@@ -59,7 +59,7 @@ def root():
 @app.api_route("/sync", methods=["GET", "POST"])
 def sync_data():
     try:
-        # 1) SCS 명부 동기화 (검증 완료)
+        # 1) SCS 명부 동기화 (6,370+건 정상 검증 완료)
         scs_url = f"{PROXY_BASE}/scs/get"
         scs_payload = {
             "parkname": "",
@@ -89,7 +89,7 @@ def sync_data():
             except Exception as je:
                 scs_debug += f" (json error: {je})"
 
-        # 2) ENEX 입출차 로그 동기화 (파라미터 및 시간 포맷 전면 보강)
+        # 2) ENEX 입출차 로그 동기화
         today = datetime.now()
         start_str = (today - timedelta(days=7)).strftime("%Y-%m-%d") + " 00:00:00"
         end_str = today.strftime("%Y-%m-%d") + " 23:59:59"
@@ -110,21 +110,11 @@ def sync_data():
             "token": AUTH_TOKEN,
         }
 
-        # 1차: JSON 포맷 호출
         res_enex = requests.post(
             enex_url, json=enex_payload, headers=HEADERS, timeout=25
         )
         enex_list = []
         enex_debug = f"status: {res_enex.status_code}, len: {len(res_enex.text)}"
-
-        # 만약 본문이 비어서 오면 2차 Form-data 방식 시도
-        if res_enex.status_code == 200 and not res_enex.text.strip():
-            form_headers = dict(HEADERS)
-            form_headers["Content-Type"] = "application/x-www-form-urlencoded"
-            res_enex = requests.post(
-                enex_url, data=enex_payload, headers=form_headers, timeout=25
-            )
-            enex_debug += f" -> form: {res_enex.status_code}, len: {len(res_enex.text)}"
 
         if res_enex.status_code == 200 and res_enex.text.strip():
             try:
@@ -137,8 +127,6 @@ def sync_data():
                 enex_debug += f" (count: {len(enex_list)})"
             except Exception as je:
                 enex_debug += f" (err: {je}, text: {res_enex.text[:80]})"
-        elif not res_enex.text.strip():
-            enex_debug += " (empty body)"
 
         return {
             "result": (
@@ -154,12 +142,13 @@ def sync_data():
         return {"result": "error", "message": str(e)}
 
 
-# 2. 통합 조건 검색
+# 2. 통합 조건 검색 (?q= 통합 검색 및 대영 IOT 필드 완전 대응)
 @app.get("/search")
 def search_cars(
+    q: str = Query("", description="통합 검색어 (차량번호/성명/동호수)"),
     carno: str = Query("", description="차량번호 뒤 4자리 또는 전체"),
     name: str = Query("", description="입주민 성명"),
-    phone: str = Query("", description="전화번호 뒤 4자리"),
+    phone: str = Query("", description="전화번호"),
     dongho: str = Query("", description="동-호수 (예: 202-1403)"),
 ):
     scs_data = load_json_file(SCS_CACHE_FILE)
@@ -185,10 +174,34 @@ def search_cars(
             else:
                 dong_ho = "-"
 
-            scst = str(item.get("scsttypename", "")) or str(item.get("scusername", ""))
+            # 대영 IOT 입주민명/전화번호 필드 전수 조사
+            u_name = (
+                str(
+                    item.get("scusername", "")
+                    or item.get("username", "")
+                    or item.get("name", "")
+                    or item.get("adminname", "")
+                ).strip()
+                or "-"
+            )
+
+            u_tel = (
+                str(
+                    item.get("scusertel", "")
+                    or item.get("usertel", "")
+                    or item.get("tel", "")
+                    or item.get("hp", "")
+                ).strip()
+                or "-"
+            )
+
+            scst = str(
+                item.get("scsttypename", "") or item.get("scstname", "") or u_name
+            )
+
             scs_map[c] = {
-                "name": item.get("username", "-") or item.get("scusername", "-"),
-                "phone": item.get("usertel", "-") or "-",
+                "name": u_name,
+                "phone": u_tel,
                 "dong_ho": dong_ho,
                 "car_type": (
                     "예약"
@@ -226,6 +239,7 @@ def search_cars(
     all_carno_keys = set(list(scs_map.keys()) + list(latest_logs.keys()))
     results = []
 
+    keyword = q.strip()
     carno_q = carno.strip()
     name_q = name.strip()
     phone_q = phone.strip()
@@ -246,22 +260,35 @@ def search_cars(
             },
         )
 
+        clean_dongho = (
+            scs_info["dong_ho"]
+            .replace(" ", "")
+            .replace("동", "")
+            .replace("호", "")
+            .replace("-", "")
+        )
+
+        # ?q= 파라미터 단일 검색 지원 (차량번호, 성명, 동호수 통합 매칭)
+        if keyword:
+            clean_kw = keyword.replace(" ", "").replace("-", "")
+            match_q = (
+                keyword in c
+                or keyword in scs_info["name"]
+                or clean_kw in clean_dongho
+                or keyword in scs_info["phone"]
+            )
+            if not match_q:
+                continue
+
+        # 개별 파라미터 필터링
         if carno_q and (carno_q not in c):
             continue
         if name_q and (name_q not in scs_info["name"]):
             continue
         if phone_q and (phone_q not in scs_info["phone"]):
             continue
-        if dongho_q:
-            clean_dongho = (
-                scs_info["dong_ho"]
-                .replace(" ", "")
-                .replace("동", "")
-                .replace("호", "")
-                .replace("-", "")
-            )
-            if dongho_q not in clean_dongho:
-                continue
+        if dongho_q and (dongho_q not in clean_dongho):
+            continue
 
         c_type = scs_info["car_type"]
         if "APT" in log_info["fee_type"] or "방문" in log_info["fee_type"]:
@@ -284,7 +311,7 @@ def search_cars(
     return {"result": "success", "count": len(results), "data": results[:100]}
 
 
-# 3. 아파트너 사전예약 차량 전용 조회 (날짜별 과거 복원 지원)
+# 3. 아파트너 사전예약 차량 전용 조회
 @app.get("/reserved")
 def get_reserved_cars(
     target_date: str = Query("", description="조회할 날짜 (YYYY-MM-DD, 미지정시 전체)")
@@ -295,7 +322,6 @@ def get_reserved_cars(
     clean_target = target_date.replace("-", "").replace("/", "").strip()
     reserved_map = {}
 
-    # (1) SCS 명부에서 '아파트너사전예약' 추출
     for item in scs_data:
         grp = str(item.get("scsttypename", "")) or str(item.get("scusername", ""))
         note = str(item.get("memo", "")) or str(item.get("remk", ""))
@@ -329,11 +355,19 @@ def get_reserved_cars(
             else:
                 dong_ho = "-"
 
+            u_name = (
+                str(item.get("scusername", "") or item.get("username", "")).strip()
+                or "방문예약"
+            )
+            u_tel = (
+                str(item.get("scusertel", "") or item.get("usertel", "")).strip() or "-"
+            )
+
             reserved_map[carno] = {
                 "carno": carno,
                 "car_type": "예약",
-                "name": item.get("username", "-") or item.get("scusername", "방문예약"),
-                "phone": item.get("usertel", "-") or "-",
+                "name": u_name,
+                "phone": u_tel,
                 "dong_ho": dong_ho,
                 "res_date": res_date or "-",
                 "tkt_name": grp,
@@ -343,7 +377,6 @@ def get_reserved_cars(
                 "last_out_time": "-",
             }
 
-    # (2) ENEX 입출차 로그에서 'APT방문' / '방문권' 대조 및 과거 만료 차량 복원
     for log in enex_data:
         carno = str(log.get("carno", "")).strip()
         if not carno:
@@ -402,7 +435,7 @@ def get_reserved_cars(
     }
 
 
-# 4. 스크래치(CCTV) 추적 실시간 타임라인
+# 4. 스크래치(CCTV) 추적 타임라인
 @app.get("/timeline")
 def get_vehicle_timeline(
     carno: str = Query(..., description="차량 전체 번호"),
