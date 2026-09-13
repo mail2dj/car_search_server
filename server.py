@@ -49,6 +49,34 @@ def save_json_file(file_path, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+def extract_phone(item):
+    for k in [
+        "phoneno",
+        "usertel",
+        "scusertel",
+        "tel",
+        "hp",
+        "mobile",
+        "cellphone",
+        "tel1",
+    ]:
+        val = str(item.get(k, "")).strip()
+        if val and val != "-" and len(val) >= 7:
+            return val
+    return "-"
+
+
+def extract_name(item):
+    for k in ["siname", "owner", "scusername", "username", "name"]:
+        val = str(item.get(k, "")).strip()
+        if val and val not in ["정기", "일반", "방문", "사전예약", "아파트너", "-"]:
+            return val
+    raw = str(
+        item.get("siname") or item.get("username") or item.get("scusername") or "-"
+    ).strip()
+    return raw if raw else "-"
+
+
 @app.get("/")
 def root():
     return {"status": "running", "message": "방재실 통합 관제 백엔드 정상 작동 중"}
@@ -126,7 +154,7 @@ def sync_data():
         return {"result": "error", "message": str(e)}
 
 
-# 2. 통합 검색 (?q= 차량번호, siname 이름, 동호수, 전화번호)
+# 2. 통합 검색 (?q= 차량번호, 이름, 동호수, 전화번호)
 @app.get("/search")
 def search_car(
     q: str = Query("", description="검색어 (차량번호, 사람 이름, 동호수, 전화번호)"),
@@ -140,71 +168,35 @@ def search_car(
     scs_data = load_json_file(SCS_CACHE_FILE)
     enex_data = load_json_file(ENEX_CACHE_FILE)
 
-    def extract_phone(item):
-        """대영 시스템의 온갖 전화번호 키를 싹 다 뒤져서 반환"""
-        raw = (
-            item.get("phoneno")
-            or item.get("usertel")
-            or item.get("scusertel")
-            or item.get("tel")
-            or item.get("hp")
-            or item.get("mobile")
-            or item.get("cellphone")
-            or item.get("tel1")
-            or ""
-        )
-        return str(raw).strip()
-
-    latest_logs = {}
-    for item in enex_data:
-        c = str(item.get("carno", "")).strip().replace(" ", "")
-        if not c:
+    # 1) 입출차 로그에서 차량별 최신 통과 상태 맵핑 (최근 통과 기록 보존)
+    enex_map = {}
+    for log in enex_data:
+        c = str(log.get("carno", "")).strip().replace(" ", "")
+        if not c or c in enex_map:
             continue
-
-        s_name = str(item.get("siname", "") or item.get("username", "") or "").strip()
-        dong = str(item.get("part", "")).strip()
-        ho = str(item.get("pos", "")).strip()
-        dong_ho = f"{dong}동 {ho}호" if dong and ho else ""
-        phone = extract_phone(item)
-        io_type = str(item.get("enextypename") or item.get("io") or "-").strip()
+        io_type = str(log.get("enextypename") or log.get("io") or "-").strip()
         event_time = str(
-            item.get("enexdt") or item.get("entdt") or item.get("enextime") or "-"
+            log.get("enexdt") or log.get("entdt") or log.get("enextime") or "-"
         )
-        gate = str(item.get("eqname") or item.get("parkname") or "-")
+        gate = str(log.get("eqname") or log.get("parkname") or "-")
 
-        if c not in latest_logs:
-            latest_logs[c] = {
-                "carno": item.get("carno"),
-                "name": s_name,
-                "dong_ho": dong_ho,
-                "phone": phone if phone else "-",
-                "parking_status": "🟢 주차 중" if io_type == "입차" else "⚪ 출차 완료",
-                "last_event": f"{io_type} ({gate})",
-                "last_time": event_time,
-            }
+        enex_map[c] = {
+            "parking_status": "🟢 주차 중" if io_type == "입차" else "⚪ 출차 완료",
+            "last_event": f"{io_type} ({gate})",
+            "last_time": event_time,
+        }
 
+    # 2) SCS 정기권/예약 명부를 1순위로 조회 (전화번호, 입주민 이름 무조건 보존)
     matched = []
-    for c, log in latest_logs.items():
-        clean_phone = log["phone"].replace("-", "")
-        if (
-            (keyword in c)
-            or (log["name"] and keyword in log["name"])
-            or (keyword in log["dong_ho"].replace(" ", ""))
-            or (clean_phone and keyword in clean_phone)
-        ):
-            matched.append(log)
+    matched_carnos = set()
 
-    scs_matched_carnos = {m["carno"] for m in matched}
     for item in scs_data:
         c = str(item.get("carno", "")).strip()
-        if not c or c in scs_matched_carnos:
+        clean_c = c.replace(" ", "")
+        if not clean_c:
             continue
 
-        u_name = str(
-            item.get("siname", "")
-            or item.get("username", "")
-            or item.get("scusername", "")
-        ).strip()
+        u_name = extract_name(item)
         dong = str(item.get("part", "") or item.get("dong", "")).strip()
         ho = str(item.get("pos", "") or item.get("ho", "")).strip()
         org = str(item.get("org", "")).strip()
@@ -212,23 +204,70 @@ def search_car(
         phone = extract_phone(item)
         clean_phone = phone.replace("-", "")
 
+        # 검색어 매칭
         if (
-            (keyword in c.replace(" ", ""))
-            or (u_name and keyword in u_name)
+            (keyword in clean_c)
+            or (u_name != "-" and keyword in u_name)
             or (keyword in dong_ho.replace(" ", ""))
-            or (clean_phone and keyword in clean_phone)
+            or (clean_phone != "-" and keyword in clean_phone)
         ):
+            # 입출차 기록과 결합
+            log_info = enex_map.get(clean_c)
+            if log_info:
+                p_status = log_info["parking_status"]
+                l_event = log_info["last_event"]
+                l_time = log_info["last_time"]
+            else:
+                p_status = "⚪ 미통과 (기록 없음)"
+                l_event = "-"
+                l_time = "-"
+
             matched.append(
                 {
                     "carno": c,
-                    "name": u_name if u_name else "-",
+                    "name": u_name,
                     "dong_ho": dong_ho,
-                    "phone": phone if phone else "-",
-                    "parking_status": "출차 완료",
-                    "last_event": "-",
-                    "last_time": "-",
+                    "phone": phone,
+                    "parking_status": p_status,
+                    "last_event": l_event,
+                    "last_time": l_time,
                 }
             )
+            matched_carnos.add(clean_c)
+
+    # 3) SCS 명부에는 없지만 입출차 기록(일반 방문차량 등)에만 존재하는 경우 보충
+    for item in enex_data:
+        c = str(item.get("carno", "")).strip()
+        clean_c = c.replace(" ", "")
+        if not clean_c or clean_c in matched_carnos:
+            continue
+
+        s_name = extract_name(item)
+        dong = str(item.get("part", "")).strip()
+        ho = str(item.get("pos", "")).strip()
+        dong_ho = f"{dong}동 {ho}호" if dong and ho else "-"
+        phone = extract_phone(item)
+        clean_phone = phone.replace("-", "")
+
+        if (
+            (keyword in clean_c)
+            or (s_name != "-" and keyword in s_name)
+            or (keyword in dong_ho.replace(" ", ""))
+            or (clean_phone != "-" and keyword in clean_phone)
+        ):
+            log_info = enex_map.get(clean_c, {})
+            matched.append(
+                {
+                    "carno": c,
+                    "name": s_name,
+                    "dong_ho": dong_ho,
+                    "phone": phone,
+                    "parking_status": log_info.get("parking_status", "⚪ 출차 완료"),
+                    "last_event": log_info.get("last_event", "-"),
+                    "last_time": log_info.get("last_time", "-"),
+                }
+            )
+            matched_carnos.add(clean_c)
 
     return {"result": "success", "count": len(matched), "data": matched[:100]}
 
@@ -294,7 +333,7 @@ def get_reserved_cars(target_date: str = Query("", description="조회일자")):
                     "carno": carno,
                     "car_type": "예약",
                     "name": "아파트너사전예약",
-                    "phone": str(item.get("tel", "") or "-"),
+                    "phone": extract_phone(item),
                     "dong_ho": dong_ho,
                     "res_date": res_date,
                     "start_time": item.get("usebgndt", "-"),
