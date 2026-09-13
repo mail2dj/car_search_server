@@ -21,8 +21,10 @@ ENEX_CACHE_FILE = os.path.join(BASE_DIR, "enex_log.json")
 
 PROXY_BASE = "http://121.144.101.67:8080/http://192.168.100.10:9935"
 
+# 대영 IOT 전용 인증 토큰
 AUTH_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIwMjQyMDY0ODgiLCJuYW1lIjoiaHR0cDovL3d3dy5keWlrMjEuY28ua3IvIiwidmlzaW9uIjoidjQifQ.FWrZJsSj3ElO7tSp4QHMDM5TJ5HsvTyuJK0ByzSv1Q8"
 
+# 프록시 및 대영 IOT 필수 통신 헤더
 HEADERS = {
     "x-requested-with": "XMLHttpRequest",
     "Origin": "http://121.144.101.67:8080",
@@ -53,11 +55,11 @@ def root():
     return {"status": "running", "message": "방재실 통합 관제 백엔드 정상 작동 중"}
 
 
-# 1. 1방재실 최신 관제 동기화
+# 1. 1방재실 최신 관제 동기화 (GET/POST 지원)
 @app.api_route("/sync", methods=["GET", "POST"])
 def sync_data():
     try:
-        # 1) SCS 명부 동기화 (6,373건 성공 검증 완료)
+        # 1) SCS 명부 동기화 (검증 완료)
         scs_url = f"{PROXY_BASE}/scs/get"
         scs_payload = {
             "parkname": "",
@@ -87,38 +89,42 @@ def sync_data():
             except Exception as je:
                 scs_debug += f" (json error: {je})"
 
-        # 2) ENEX 입출차 로그 동기화 (최근 7일치로 안정성 확보 및 JSON/Form 순차 시도)
+        # 2) ENEX 입출차 로그 동기화 (파라미터 및 시간 포맷 전면 보강)
         today = datetime.now()
-        start_date = (today - timedelta(days=7)).strftime("%Y-%m-%d")
-        today_str = today.strftime("%Y-%m-%d")
+        start_str = (today - timedelta(days=7)).strftime("%Y-%m-%d") + " 00:00:00"
+        end_str = today.strftime("%Y-%m-%d") + " 23:59:59"
 
         enex_url = f"{PROXY_BASE}/enexrcg"
         enex_payload = {
-            "sdate": start_date,
-            "edate": today_str,
+            "sdate": start_str,
+            "edate": end_str,
+            "startdate": start_str,
+            "enddate": end_str,
             "carno": "",
             "parkname": "",
             "eqname": "",
             "enextypename": "",
             "tkttypename": "",
+            "page": 1,
+            "rows": 5000,
             "token": AUTH_TOKEN,
         }
 
-        # 1차 시도: JSON 포맷
+        # 1차: JSON 포맷 호출
         res_enex = requests.post(
             enex_url, json=enex_payload, headers=HEADERS, timeout=25
         )
         enex_list = []
-        enex_debug = f"status: {res_enex.status_code}"
+        enex_debug = f"status: {res_enex.status_code}, len: {len(res_enex.text)}"
 
-        # 만약 본문이 비어서 오면 2차 시도 (Form-data 방식)
+        # 만약 본문이 비어서 오면 2차 Form-data 방식 시도
         if res_enex.status_code == 200 and not res_enex.text.strip():
             form_headers = dict(HEADERS)
             form_headers["Content-Type"] = "application/x-www-form-urlencoded"
             res_enex = requests.post(
                 enex_url, data=enex_payload, headers=form_headers, timeout=25
             )
-            enex_debug += " (fallback to form)"
+            enex_debug += f" -> form: {res_enex.status_code}, len: {len(res_enex.text)}"
 
         if res_enex.status_code == 200 and res_enex.text.strip():
             try:
@@ -126,13 +132,13 @@ def sync_data():
                 if isinstance(parsed, list):
                     enex_list = parsed
                 elif isinstance(parsed, dict):
-                    enex_list = parsed.get("list", [])
+                    enex_list = parsed.get("list", parsed.get("rows", []))
                 save_json_file(ENEX_CACHE_FILE, enex_list)
                 enex_debug += f" (count: {len(enex_list)})"
             except Exception as je:
-                enex_debug += f" (text: {res_enex.text[:100]}, err: {je})"
+                enex_debug += f" (err: {je}, text: {res_enex.text[:80]})"
         elif not res_enex.text.strip():
-            enex_debug += " (empty response body)"
+            enex_debug += " (empty body)"
 
         return {
             "result": (
@@ -278,7 +284,7 @@ def search_cars(
     return {"result": "success", "count": len(results), "data": results[:100]}
 
 
-# 3. 아파트너 사전예약 차량 전용 조회
+# 3. 아파트너 사전예약 차량 전용 조회 (날짜별 과거 복원 지원)
 @app.get("/reserved")
 def get_reserved_cars(
     target_date: str = Query("", description="조회할 날짜 (YYYY-MM-DD, 미지정시 전체)")
@@ -289,6 +295,7 @@ def get_reserved_cars(
     clean_target = target_date.replace("-", "").replace("/", "").strip()
     reserved_map = {}
 
+    # (1) SCS 명부에서 '아파트너사전예약' 추출
     for item in scs_data:
         grp = str(item.get("scsttypename", "")) or str(item.get("scusername", ""))
         note = str(item.get("memo", "")) or str(item.get("remk", ""))
@@ -336,6 +343,7 @@ def get_reserved_cars(
                 "last_out_time": "-",
             }
 
+    # (2) ENEX 입출차 로그에서 'APT방문' / '방문권' 대조 및 과거 만료 차량 복원
     for log in enex_data:
         carno = str(log.get("carno", "")).strip()
         if not carno:
@@ -394,7 +402,7 @@ def get_reserved_cars(
     }
 
 
-# 4. 스크래치(CCTV) 추적 타임라인
+# 4. 스크래치(CCTV) 추적 실시간 타임라인
 @app.get("/timeline")
 def get_vehicle_timeline(
     carno: str = Query(..., description="차량 전체 번호"),
@@ -404,8 +412,8 @@ def get_vehicle_timeline(
     try:
         url = f"{PROXY_BASE}/enexrcg"
         payload = {
-            "sdate": sdate,
-            "edate": edate,
+            "sdate": sdate + " 00:00:00",
+            "edate": edate + " 23:59:59",
             "carno": carno.strip(),
             "parkname": "",
             "eqname": "",
@@ -417,7 +425,7 @@ def get_vehicle_timeline(
         if res.status_code == 200:
             logs = res.json()
             if isinstance(logs, dict):
-                logs = logs.get("list", [])
+                logs = logs.get("list", logs.get("rows", []))
             timeline = []
             for item in logs:
                 timeline.append(
