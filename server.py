@@ -42,6 +42,7 @@ def root():
     return {"status": "running", "message": "방재실 통합 관제 백엔드 정상 작동 중"}
 
 
+# 1. 1방재실 최신 관제 동기화 (Sync)
 @app.post("/sync")
 def sync_data():
     try:
@@ -91,6 +92,7 @@ def sync_data():
         return {"result": "error", "message": str(e)}
 
 
+# 2. 통합 조건 검색
 @app.get("/search")
 def search_cars(
     carno: str = Query("", description="차량번호 뒤 4자리 또는 전체"),
@@ -220,6 +222,7 @@ def search_cars(
     return {"result": "success", "count": len(results), "data": results[:100]}
 
 
+# 3. 아파트너 사전예약 차량 전용 조회 (어제/과거 날짜 로그 복원 지원)
 @app.get("/reserved")
 def get_reserved_cars(
     target_date: str = Query("", description="조회할 날짜 (YYYY-MM-DD, 미지정시 전체)")
@@ -229,6 +232,7 @@ def get_reserved_cars(
 
     reserved_map = {}
 
+    # (1) SCS 명부에서 '아파트너사전예약' 추출
     for item in scs_data:
         grp = str(item.get("scsttypename", ""))
         note = str(item.get("memo", "")) or str(item.get("remk", ""))
@@ -238,6 +242,7 @@ def get_reserved_cars(
             sdate_full = str(item.get("sdate", "")) or str(item.get("startdate", ""))
             res_date = sdate_full.split(" ")[0] if sdate_full else ""
 
+            # 날짜 필터가 있고 날짜가 다르면 명부에서는 우선 제외
             if target_date and res_date and (target_date != res_date):
                 continue
 
@@ -271,21 +276,52 @@ def get_reserved_cars(
                 "last_out_time": "-",
             }
 
+    # (2) ENEX 입출차 로그에서 'APT방문' / '방문권' 대조 및 과거 예약차량 복원
     for log in enex_data:
         carno = str(log.get("carno", "")).strip()
+        if not carno:
+            continue
+
+        fee = str(log.get("feename", "")) or str(log.get("parkname", ""))
+        tkt = str(log.get("tkttypename", ""))
         io_type = log.get("enextypename", "")
-        event_time = log.get("enextime", "-")
+        event_time = str(log.get("enextime", "-"))
         gate = log.get("eqname", "-")
 
-        if carno in reserved_map:
-            target = reserved_map[carno]
-            target["last_event"] = f"{io_type} ({gate})"
-            if io_type == "입차":
-                target["parking_status"] = "주차 중"
-                target["last_in_time"] = event_time
-            elif io_type == "출차":
-                target["parking_status"] = "출차 완료"
-                target["last_out_time"] = event_time
+        log_date = event_time.split(" ")[0] if " " in event_time else ""
+        is_apt_visit = (
+            "APT" in fee or "방문" in fee or "방문" in tkt or "사전예약" in tkt
+        )
+
+        # 날짜 필터가 지정되어 있을 때 해당 일자가 아니면 패스
+        if target_date and log_date and (target_date != log_date):
+            continue
+
+        if is_apt_visit or carno in reserved_map:
+            if carno not in reserved_map:
+                # 명부에서 만료 삭제되었으나 로그상 APT방문으로 들어왔던 과거 차량
+                reserved_map[carno] = {
+                    "carno": carno,
+                    "car_type": "예약",
+                    "name": "방문예약",
+                    "phone": "-",
+                    "dong_ho": "-",
+                    "res_date": log_date,
+                    "tkt_name": fee if fee else tkt,
+                    "parking_status": "출차 완료" if io_type == "출차" else "주차 중",
+                    "last_event": f"{io_type} ({gate})",
+                    "last_in_time": event_time if io_type == "입차" else "-",
+                    "last_out_time": event_time if io_type == "출차" else "-",
+                }
+            else:
+                target = reserved_map[carno]
+                target["last_event"] = f"{io_type} ({gate})"
+                if io_type == "입차":
+                    target["parking_status"] = "주차 중"
+                    target["last_in_time"] = event_time
+                elif io_type == "출차":
+                    target["parking_status"] = "출차 완료"
+                    target["last_out_time"] = event_time
 
     results = list(reserved_map.values())
     return {
@@ -296,6 +332,7 @@ def get_reserved_cars(
     }
 
 
+# 4. 스크래치(CCTV) 추적 타임라인
 @app.get("/timeline")
 def get_vehicle_timeline(
     carno: str = Query(..., description="차량 전체 번호"),
