@@ -1,36 +1,115 @@
-# 3. 아파트너 사전예약 차량 전용 조회 (날짜 필터 + 동호수 정밀 매칭)
-@app.get("/reserved")
-def get_reserved_cars(
-    target_date: str = Query(
-        "", description="조회할 날짜 (YYYY-MM-DD, 비어있으면 전체)"
-    )
+import os
+import json
+import requests
+from datetime import datetime
+from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI(title="방재실 주차 관제 통합 서버")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SCS_CACHE_FILE = os.path.join(BASE_DIR, "scs_user.json")
+ENEX_CACHE_FILE = os.path.join(BASE_DIR, "enex_log.json")
+
+PROXY_BASE = "http://121.144.101.67:8080/http://192.168.100.10:9935"
+
+
+def load_json_file(file_path):
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+
+def save_json_file(file_path, data):
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+@app.get("/")
+def root():
+    return {"status": "running", "message": "방재실 통합 관제 백엔드 정상 작동 중"}
+
+
+@app.post("/sync")
+def sync_data():
+    try:
+        scs_url = f"{PROXY_BASE}/scs/get"
+        scs_payload = {
+            "parkname": "",
+            "carno": "",
+            "username": "",
+            "org": "",
+            "part": "",
+            "pos": "",
+            "scuserid": "",
+            "scsttypeid": "",
+            "shopid": "",
+            "carexist": 0,
+        }
+        res_scs = requests.post(scs_url, json=scs_payload, timeout=20)
+        scs_list = []
+        if res_scs.status_code == 200:
+            scs_list = res_scs.json().get("list", [])
+            save_json_file(SCS_CACHE_FILE, scs_list)
+
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        enex_url = f"{PROXY_BASE}/enexrcg"
+        enex_payload = {
+            "sdate": "2026-09-01",
+            "edate": today_str,
+            "carno": "",
+            "parkname": "",
+            "eqname": "",
+            "enextypename": "",
+            "tkttypename": "",
+        }
+        res_enex = requests.post(enex_url, json=enex_payload, timeout=25)
+        enex_list = []
+        if res_enex.status_code == 200:
+            enex_list = res_enex.json().get("list", [])
+            save_json_file(ENEX_CACHE_FILE, enex_list)
+
+        return {
+            "result": "success",
+            "message": "1방재실 최신 관제 동기화 완료",
+            "scs_count": len(scs_list),
+            "enex_count": len(enex_list),
+        }
+    except Exception as e:
+        return {"result": "error", "message": str(e)}
+
+
+@app.get("/search")
+def search_cars(
+    carno: str = Query("", description="차량번호 뒤 4자리 또는 전체"),
+    name: str = Query("", description="입주민 성명"),
+    phone: str = Query("", description="전화번호 뒤 4자리"),
+    dongho: str = Query("", description="동-호수 (예: 202-1403)"),
 ):
     scs_data = load_json_file(SCS_CACHE_FILE)
     enex_data = load_json_file(ENEX_CACHE_FILE)
 
-    reserved_map = {}
-
-    # (1) SCS 명부에서 아파트너 예약 차량 추출 및 동·호수 완벽 파싱
+    scs_map = {}
     for item in scs_data:
-        grp = str(item.get("scsttypename", ""))
-        note = str(item.get("memo", "")) or str(item.get("remk", ""))
-        carno = str(item.get("carno", "")).strip()
-
-        if "아파트너" in grp or "사전예약" in grp or "APTNER" in note or "APT" in grp:
-            # 시작일시 체크 (예: "2026-09-13 12:00:00" -> "2026-09-13")
-            sdate_full = str(item.get("sdate", "")) or str(item.get("startdate", ""))
-            res_date = sdate_full.split(" ")[0] if sdate_full else ""
-
-            # 날짜 필터가 들어온 경우 해당 날짜 예약만 필터링
-            if target_date and res_date and (target_date != res_date):
-                continue
-
-            # 동-호수 완벽 추출 (org: '203-1402', part: '203', pos: '1402')
+        c = str(item.get("carno", "")).strip()
+        if c:
             dong = (
                 str(item.get("part", "")).strip() or str(item.get("dong", "")).strip()
             )
             ho = str(item.get("pos", "")).strip() or str(item.get("ho", "")).strip()
-            org = str(item.get("org", "")).strip()  # '203-1402' 형태로 들어오는 필드
+            org = str(item.get("org", "")).strip()
 
             if dong and ho:
                 dong_ho = f"{dong}동 {ho}호"
@@ -40,7 +119,143 @@ def get_reserved_cars(
             elif org:
                 dong_ho = org
             else:
-                dong_ho = "동호수 미기재"
+                dong_ho = "-"
+
+            scst = str(item.get("scsttypename", ""))
+            scs_map[c] = {
+                "name": item.get("username", "-") or "-",
+                "phone": item.get("usertel", "-") or "-",
+                "dong_ho": dong_ho,
+                "car_type": (
+                    "예약"
+                    if ("아파트너" in scst or "사전예약" in scst or "APT" in scst)
+                    else "정기"
+                ),
+            }
+
+    latest_logs = {}
+    for log in enex_data:
+        c = str(log.get("carno", "")).strip()
+        if not c:
+            continue
+        event_time = log.get("enextime", "-")
+        io_type = log.get("enextypename", "-")
+        gate = log.get("eqname", "-") or log.get("parkname", "-")
+        fee = log.get("feename", "") or ""
+        tkt = log.get("tkttypename", "") or ""
+
+        if c not in latest_logs:
+            latest_logs[c] = {
+                "last_event": f"{io_type} ({gate})",
+                "parking_status": "출차 완료" if io_type == "출차" else "주차 중",
+                "last_in_time": event_time if io_type == "입차" else "-",
+                "last_out_time": event_time if io_type == "출차" else "-",
+                "fee_type": fee if fee else tkt,
+            }
+        else:
+            cur = latest_logs[c]
+            if io_type == "입차" and cur["last_in_time"] == "-":
+                cur["last_in_time"] = event_time
+            elif io_type == "출차" and cur["last_out_time"] == "-":
+                cur["last_out_time"] = event_time
+
+    all_carno_keys = set(list(scs_map.keys()) + list(latest_logs.keys()))
+    results = []
+
+    carno_q = carno.strip()
+    name_q = name.strip()
+    phone_q = phone.strip()
+    dongho_q = dongho.replace(" ", "").replace("-", "").strip()
+
+    for c in all_carno_keys:
+        scs_info = scs_map.get(
+            c, {"name": "-", "phone": "-", "dong_ho": "-", "car_type": "일반"}
+        )
+        log_info = latest_logs.get(
+            c,
+            {
+                "last_event": "-",
+                "parking_status": "출차 완료",
+                "last_in_time": "-",
+                "last_out_time": "-",
+                "fee_type": "-",
+            },
+        )
+
+        if carno_q and (carno_q not in c):
+            continue
+        if name_q and (name_q not in scs_info["name"]):
+            continue
+        if phone_q and (phone_q not in scs_info["phone"]):
+            continue
+        if dongho_q:
+            clean_dongho = (
+                scs_info["dong_ho"]
+                .replace(" ", "")
+                .replace("동", "")
+                .replace("호", "")
+                .replace("-", "")
+            )
+            if dongho_q not in clean_dongho:
+                continue
+
+        c_type = scs_info["car_type"]
+        if "APT" in log_info["fee_type"] or "방문" in log_info["fee_type"]:
+            c_type = "예약"
+
+        results.append(
+            {
+                "carno": c,
+                "car_type": c_type,
+                "dong_ho": scs_info["dong_ho"],
+                "name": scs_info["name"],
+                "phone": scs_info["phone"],
+                "parking_status": log_info["parking_status"],
+                "last_event": log_info["last_event"],
+                "last_in_time": log_info["last_in_time"],
+                "last_out_time": log_info["last_out_time"],
+            }
+        )
+
+    return {"result": "success", "count": len(results), "data": results[:100]}
+
+
+@app.get("/reserved")
+def get_reserved_cars(
+    target_date: str = Query("", description="조회할 날짜 (YYYY-MM-DD, 미지정시 전체)")
+):
+    scs_data = load_json_file(SCS_CACHE_FILE)
+    enex_data = load_json_file(ENEX_CACHE_FILE)
+
+    reserved_map = {}
+
+    for item in scs_data:
+        grp = str(item.get("scsttypename", ""))
+        note = str(item.get("memo", "")) or str(item.get("remk", ""))
+        carno = str(item.get("carno", "")).strip()
+
+        if "아파트너" in grp or "사전예약" in grp or "APTNER" in note or "APT" in grp:
+            sdate_full = str(item.get("sdate", "")) or str(item.get("startdate", ""))
+            res_date = sdate_full.split(" ")[0] if sdate_full else ""
+
+            if target_date and res_date and (target_date != res_date):
+                continue
+
+            dong = (
+                str(item.get("part", "")).strip() or str(item.get("dong", "")).strip()
+            )
+            ho = str(item.get("pos", "")).strip() or str(item.get("ho", "")).strip()
+            org = str(item.get("org", "")).strip()
+
+            if dong and ho:
+                dong_ho = f"{dong}동 {ho}호"
+            elif org and "-" in org:
+                parts = org.split("-")
+                dong_ho = f"{parts[0]}동 {parts[1]}호"
+            elif org:
+                dong_ho = org
+            else:
+                dong_ho = "-"
 
             reserved_map[carno] = {
                 "carno": carno,
@@ -48,7 +263,7 @@ def get_reserved_cars(
                 "name": item.get("username", "-") or "방문예약",
                 "phone": item.get("usertel", "-") or "-",
                 "dong_ho": dong_ho,
-                "res_date": res_date,
+                "res_date": res_date or "-",
                 "tkt_name": grp,
                 "parking_status": "입차 대기",
                 "last_event": "-",
@@ -56,14 +271,11 @@ def get_reserved_cars(
                 "last_out_time": "-",
             }
 
-    # (2) ENEX 입출차 로그와 매칭하여 실시간 주차 상태 반영
     for log in enex_data:
         carno = str(log.get("carno", "")).strip()
         io_type = log.get("enextypename", "")
         event_time = log.get("enextime", "-")
         gate = log.get("eqname", "-")
-        fee = str(log.get("feename", "")) or str(log.get("parkname", ""))
-        tkt = str(log.get("tkttypename", ""))
 
         if carno in reserved_map:
             target = reserved_map[carno]
@@ -82,6 +294,51 @@ def get_reserved_cars(
         "count": len(results),
         "data": results,
     }
+
+
+@app.get("/timeline")
+def get_vehicle_timeline(
+    carno: str = Query(..., description="차량 전체 번호"),
+    sdate: str = Query(..., description="시작일자 (YYYY-MM-DD)"),
+    edate: str = Query(..., description="종료일자 (YYYY-MM-DD)"),
+):
+    try:
+        url = f"{PROXY_BASE}/enexrcg"
+        payload = {
+            "sdate": sdate,
+            "edate": edate,
+            "carno": carno.strip(),
+            "parkname": "",
+            "eqname": "",
+            "enextypename": "",
+            "tkttypename": "",
+        }
+        res = requests.post(url, json=payload, timeout=15)
+        if res.status_code == 200:
+            logs = res.json().get("list", [])
+            timeline = []
+            for item in logs:
+                timeline.append(
+                    {
+                        "time": item.get("enextime", "-"),
+                        "type": item.get("enextypename", "-"),
+                        "gate": item.get("eqname", "-") or item.get("parkname", "-"),
+                        "tkt": item.get("feename", "-") or item.get("tkttypename", "-"),
+                    }
+                )
+            return {
+                "result": "success",
+                "carno": carno,
+                "count": len(timeline),
+                "timeline": timeline,
+            }
+        else:
+            return {
+                "result": "error",
+                "message": f"대영 IOT 응답 오류 ({res.status_code})",
+            }
+    except Exception as e:
+        return {"result": "error", "message": str(e)}
 
 
 # import os
