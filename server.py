@@ -1,3 +1,4 @@
+import re
 import os
 import json
 import requests
@@ -184,33 +185,69 @@ def search_car(
     #         return "dongho"
     #     return None
 
+    # def get_match_type(target_carno, target_name, target_dongho, target_phone):
+    #     clean_c = target_carno.replace(" ", "")
+    #     clean_p = target_phone.replace("-", "").strip()
+
+    #     # 1. 차량번호: 4자리 입력 시 끝자리 일치, 그 외는 포함
+    #     if (is_four_digits and clean_c.endswith(keyword)) or (not is_four_digits and keyword in clean_c):
+    #         return "carno"
+
+    #     # 2. 전화번호 정밀 매칭:
+    #     # 4자리 검색 시 국번(중간 4자리)이나 뒷번호(끝 4자리)와 딱 맞을 때만 인정!
+    #     if clean_p != "-" and len(clean_p) >= 8:
+    #         if is_four_digits:
+    #             # 010-XXXX-YYYY 구조에서 중간 4자리(clean_p[-8:-4]) 또는 끝 4자리(clean_p[-4:])
+    #             mid_4 = clean_p[-8:-4]
+    #             last_4 = clean_p[-4:]
+    #             if keyword == mid_4 or keyword == last_4:
+    #                 return "phone"
+    #         else:
+    #             if keyword in clean_p:
+    #                 return "phone"
+
+    #     # 3. 이름 매칭
+    #     if target_name != "-" and keyword in target_name:
+    #         return "name"
+
+    #     # 4. 동호수 매칭
+    #     if keyword in target_dongho.replace(" ", ""):
+    #         return "dongho"
+
+    #     return None
+
     def get_match_type(target_carno, target_name, target_dongho, target_phone):
         clean_c = target_carno.replace(" ", "")
-        clean_p = target_phone.replace("-", "").strip()
+        
+        # 1. 차량번호 매칭: 4자리 숫자면 끝 4자리만 일치, 아니면 포함
+        if is_four_digits:
+            if clean_c.endswith(keyword):
+                return "carno"
+        else:
+            if keyword in clean_c:
+                return "carno"
 
-        # 1. 차량번호: 4자리 입력 시 끝자리 일치, 그 외는 포함
-        if (is_four_digits and clean_c.endswith(keyword)) or (not is_four_digits and keyword in clean_c):
-            return "carno"
-
-        # 2. 전화번호 정밀 매칭:
-        # 4자리 검색 시 국번(중간 4자리)이나 뒷번호(끝 4자리)와 딱 맞을 때만 인정!
-        if clean_p != "-" and len(clean_p) >= 8:
+        # 2. 전화번호 매칭: 숫자만 추출해서 국번(가운데) 또는 뒷자리(끝)와 정확히 일치하는지 확인
+        only_digits = re.sub(r'[^0-9]', '', target_phone)
+        if len(only_digits) >= 8:
             if is_four_digits:
-                # 010-XXXX-YYYY 구조에서 중간 4자리(clean_p[-8:-4]) 또는 끝 4자리(clean_p[-4:])
-                mid_4 = clean_p[-8:-4]
-                last_4 = clean_p[-4:]
-                if keyword == mid_4 or keyword == last_4:
+                # 번호가 11자리(010-1234-5678)면: 국번=1234, 뒷자리=5678
+                # 번호가 10자리(02-1234-5678 등)면: 국번=1234, 뒷자리=5678
+                last4 = only_digits[-4:]
+                mid4 = only_digits[-8:-4]
+                if keyword == last4 or keyword == mid4:
                     return "phone"
             else:
-                if keyword in clean_p:
+                if keyword in only_digits:
                     return "phone"
 
         # 3. 이름 매칭
         if target_name != "-" and keyword in target_name:
             return "name"
 
-        # 4. 동호수 매칭
-        if keyword in target_dongho.replace(" ", ""):
+        # 4. 동호수 매칭 (숫자 4자리일 때는 동/호수 숫자가 딱 떨어지는지 확인)
+        clean_dongho = target_dongho.replace(" ", "")
+        if not is_four_digits and keyword in clean_dongho:
             return "dongho"
 
         return None
