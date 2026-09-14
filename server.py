@@ -282,18 +282,23 @@ def search_car(
         if target_name != "-" and keyword in target_name:
             return "name"
 
-        # 4. 동호수 스마트 매칭 (122-202, 122동 202호 등 완벽 지원)
-        # 타겟 동호수와 검색어에서 숫자와 한글만 남기고 정규화
-        norm_dongho = target_dongho.replace(" ", "").replace("-", "")
-        norm_keyword = keyword.replace("-", "").replace(" ", "")
+        # 4. 동호수 스마트 정밀 매칭 (122-202, 122동 202호 등 완벽 대응)
+        # 검색어에서 숫자 덩어리들을 추출 (예: "122-202" -> ['122', '202'])
+        q_numbers = re.findall(r'\d+', q)
+        target_numbers = re.findall(r'\d+', target_dongho)
 
-        # 검색어가 "122-202" 처럼 동/호수 형태일 때
-        if "-" in keyword or " " in q:
-            parts = [p.strip() for p in re.split(r'[- ]', q.strip()) if p.strip()]
-            if len(parts) >= 2:
-                dong_part, ho_part = parts[0], parts[1]
-                if dong_part in target_dongho and ho_part in target_dongho:
-                    return "dongho"
+        if len(q_numbers) >= 2 and len(target_numbers) >= 2:
+            # 검색어의 첫 번째 숫자가 '동', 두 번째 숫자가 '호'와 완벽히 일치할 때만 매칭
+            if q_numbers[0] == target_numbers[0] and q_numbers[1] == target_numbers[1]:
+                return "dongho"
+        elif not is_four_digits:
+            # 단일 단어 검색일 경우 (예: "122동")
+            clean_dongho = target_dongho.replace(" ", "")
+            norm_keyword = keyword.replace("-", "").replace(" ", "")
+            if norm_keyword and (norm_keyword in clean_dongho):
+                return "dongho"
+
+        return None
 
         # 일반 단어/숫자 포함 검사 (단순 4자리 숫자는 제외하여 잡음 방지)
         if not is_four_digits and norm_keyword and (norm_keyword in norm_dongho):
