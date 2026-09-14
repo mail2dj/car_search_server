@@ -166,22 +166,53 @@ def search_car(
     matched = []
     matched_carnos = set()
 
+    # def get_match_type(target_carno, target_name, target_dongho, target_phone):
+    #     clean_c = target_carno.replace(" ", "")
+    #     clean_p = target_phone.replace("-", "").strip()
+
+    #     # 차량번호 뒷자리(4자리 검색 시) 또는 포함
+    #     if (is_four_digits and clean_c.endswith(keyword)) or (not is_four_digits and keyword in clean_c):
+    #         return "carno"
+    #     # 전화번호 매칭 (끝자리 또는 포함)
+    #     if clean_p != "-" and keyword in clean_p:
+    #         return "phone"
+    #     # 이름 매칭
+    #     if target_name != "-" and keyword in target_name:
+    #         return "name"
+    #     # 동호수 매칭
+    #     if keyword in target_dongho.replace(" ", ""):
+    #         return "dongho"
+    #     return None
+
     def get_match_type(target_carno, target_name, target_dongho, target_phone):
         clean_c = target_carno.replace(" ", "")
         clean_p = target_phone.replace("-", "").strip()
 
-        # 차량번호 뒷자리(4자리 검색 시) 또는 포함
+        # 1. 차량번호: 4자리 입력 시 끝자리 일치, 그 외는 포함
         if (is_four_digits and clean_c.endswith(keyword)) or (not is_four_digits and keyword in clean_c):
             return "carno"
-        # 전화번호 매칭 (끝자리 또는 포함)
-        if clean_p != "-" and keyword in clean_p:
-            return "phone"
-        # 이름 매칭
+
+        # 2. 전화번호 정밀 매칭:
+        # 4자리 검색 시 국번(중간 4자리)이나 뒷번호(끝 4자리)와 딱 맞을 때만 인정!
+        if clean_p != "-" and len(clean_p) >= 8:
+            if is_four_digits:
+                # 010-XXXX-YYYY 구조에서 중간 4자리(clean_p[-8:-4]) 또는 끝 4자리(clean_p[-4:])
+                mid_4 = clean_p[-8:-4]
+                last_4 = clean_p[-4:]
+                if keyword == mid_4 or keyword == last_4:
+                    return "phone"
+            else:
+                if keyword in clean_p:
+                    return "phone"
+
+        # 3. 이름 매칭
         if target_name != "-" and keyword in target_name:
             return "name"
-        # 동호수 매칭
+
+        # 4. 동호수 매칭
         if keyword in target_dongho.replace(" ", ""):
             return "dongho"
+
         return None
 
     # 2) SCS 정기권/예약 명부 우선 조회
