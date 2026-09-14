@@ -216,10 +216,49 @@ def search_car(
 
     #     return None
 
+    # def get_match_type(target_carno, target_name, target_dongho, target_phone):
+    #     clean_c = target_carno.replace(" ", "")
+        
+    #     # 1. 차량번호 매칭: 4자리 숫자면 끝 4자리만 일치, 아니면 포함
+    #     if is_four_digits:
+    #         if clean_c.endswith(keyword):
+    #             return "carno"
+    #     else:
+    #         if keyword in clean_c:
+    #             return "carno"
+
+    #     # 2. 전화번호 매칭: 숫자만 추출해서 국번(가운데) 또는 뒷자리(끝)와 정확히 일치하는지 확인
+    #     only_digits = re.sub(r'[^0-9]', '', target_phone)
+    #     if len(only_digits) >= 8:
+    #         if is_four_digits:
+    #             # 번호가 11자리(010-1234-5678)면: 국번=1234, 뒷자리=5678
+    #             # 번호가 10자리(02-1234-5678 등)면: 국번=1234, 뒷자리=5678
+    #             last4 = only_digits[-4:]
+    #             mid4 = only_digits[-8:-4]
+    #             if keyword == last4 or keyword == mid4:
+    #                 return "phone"
+    #         else:
+    #             if keyword in only_digits:
+    #                 return "phone"
+
+    #     # 3. 이름 매칭
+    #     if target_name != "-" and keyword in target_name:
+    #         return "name"
+
+    #     # 4. 동호수 매칭 (숫자 4자리일 때는 동/호수 숫자가 딱 떨어지는지 확인)
+    #     clean_dongho = target_dongho.replace(" ", "")
+    #     if not is_four_digits and keyword in clean_dongho:
+    #         return "dongho"
+
+    #     return None
+
+
+
+
     def get_match_type(target_carno, target_name, target_dongho, target_phone):
         clean_c = target_carno.replace(" ", "")
         
-        # 1. 차량번호 매칭: 4자리 숫자면 끝 4자리만 일치, 아니면 포함
+        # 1. 차량번호: 4자리 숫자면 끝 4자리만 일치, 아니면 전체 포함
         if is_four_digits:
             if clean_c.endswith(keyword):
                 return "carno"
@@ -227,27 +266,37 @@ def search_car(
             if keyword in clean_c:
                 return "carno"
 
-        # 2. 전화번호 매칭: 숫자만 추출해서 국번(가운데) 또는 뒷자리(끝)와 정확히 일치하는지 확인
-        only_digits = re.sub(r'[^0-9]', '', target_phone)
-        if len(only_digits) >= 8:
+        # 2. 전화번호 정밀 매칭
+        digits = "".join([ch for ch in str(target_phone) if ch.isdigit()])
+        if len(digits) >= 7:
             if is_four_digits:
-                # 번호가 11자리(010-1234-5678)면: 국번=1234, 뒷자리=5678
-                # 번호가 10자리(02-1234-5678 등)면: 국번=1234, 뒷자리=5678
-                last4 = only_digits[-4:]
-                mid4 = only_digits[-8:-4]
-                if keyword == last4 or keyword == mid4:
+                last_4 = digits[-4:]
+                mid_4 = digits[-8:-4]
+                if keyword == last_4 or keyword == mid_4:
                     return "phone"
             else:
-                if keyword in only_digits:
+                if keyword in digits:
                     return "phone"
 
         # 3. 이름 매칭
         if target_name != "-" and keyword in target_name:
             return "name"
 
-        # 4. 동호수 매칭 (숫자 4자리일 때는 동/호수 숫자가 딱 떨어지는지 확인)
-        clean_dongho = target_dongho.replace(" ", "")
-        if not is_four_digits and keyword in clean_dongho:
+        # 4. 동호수 스마트 매칭 (122-202, 122동 202호 등 완벽 지원)
+        # 타겟 동호수와 검색어에서 숫자와 한글만 남기고 정규화
+        norm_dongho = target_dongho.replace(" ", "").replace("-", "")
+        norm_keyword = keyword.replace("-", "").replace(" ", "")
+
+        # 검색어가 "122-202" 처럼 동/호수 형태일 때
+        if "-" in keyword or " " in q:
+            parts = [p.strip() for p in re.split(r'[- ]', q.strip()) if p.strip()]
+            if len(parts) >= 2:
+                dong_part, ho_part = parts[0], parts[1]
+                if dong_part in target_dongho and ho_part in target_dongho:
+                    return "dongho"
+
+        # 일반 단어/숫자 포함 검사 (단순 4자리 숫자는 제외하여 잡음 방지)
+        if not is_four_digits and norm_keyword and (norm_keyword in norm_dongho):
             return "dongho"
 
         return None
